@@ -83,6 +83,31 @@ Options arguments(int argc, Char** argv)
     return options;
 }
 
+int checkPresets(int argc, Char** argv)
+{
+    Options options;
+    int first = 2;
+    if (argc > 3 && Path(argv[first]) == "--sndfile") {
+        options.sndfile = argv[first + 1];
+        first += 2;
+    }
+    if (first == argc)
+        throw std::runtime_error("provide at least one SFZ path after --check-sfz");
+    bool rejected = false;
+    for (int i = first; i < argc; ++i) {
+        const Path path(argv[i]);
+        try {
+            clay::AudioBank bank(options.sndfile);
+            const auto instrument = clay::loadInstrument(path, bank);
+            std::cout << "SFZ\tOK\t" << instrument.regions.size() << '\n';
+        } catch (const std::exception& error) {
+            rejected = true;
+            std::cout << "SFZ\tREJECT\t" << error.what() << '\n';
+        }
+    }
+    return rejected ? 2 : 0;
+}
+
 int run(const Options& options)
 {
     auto start = Clock::now();
@@ -161,9 +186,12 @@ int main(int argc, char** argv)
     try {
         if (argc == 2 && Path(argv[1]) == "--help") {
             std::cout << "Usage: claysampler --sfz preset.sfz --output directory [options] file.mid ...\n"
-                         "Options: --samplerate Hz --device index --passes count --nvrtc path --sndfile path\n";
+                         "Options: --samplerate Hz --device index --passes count --nvrtc path --sndfile path\n"
+                         "       claysampler --check-sfz [--sndfile path] preset.sfz ...\n";
             return 0;
         }
+        if (argc > 1 && Path(argv[1]) == "--check-sfz")
+            return checkPresets(argc, argv);
         return run(arguments(argc, argv));
     } catch (const std::exception& error) {
         std::cerr << "ERROR\t" << error.what() << '\n';

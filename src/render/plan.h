@@ -8,7 +8,9 @@ namespace clay {
 
 struct RenderPlan {
     std::vector<VoiceSpan> spans;
-    std::array<std::vector<ControlPoint>, 3> controls;
+    std::vector<std::vector<ControlPoint>> controls;
+    std::vector<VoiceModulation> modulation;
+    int filterTracks = 0;
     int frames = 0;
 };
 

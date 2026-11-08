@@ -33,3 +33,12 @@ Windows x86-64, RTX 4080 Laptop GPU, NVRTC 12.4. Each preset used 16 generated c
 These are whole-batch timings for the stated workloads. The same kernel also compiled for `sm_75`, `sm_86`, `sm_89` and `compute_90` with NVRTC 12.4. Audio and performance were measured on the RTX 4080 Laptop GPU.
 
 The subsequent compatibility work reran the 36 audio comparisons. See [compatibility](compatibility.md#additional-audio-checks) for those results and the additional preset checks.
+
+## Preset audit
+
+The audit uses the host-only ClaySampler loader and the sfizz C API on the same paths. It records accepted region counts, ClaySampler rejection reasons and unknown opcodes reported by sfizz. The result measures loading and sample resolution. Use the audio comparison harness for MIDI-specific behavior and sound.
+
+```sh
+python tests/audit_presets.py --clay build/claysampler --sfizz-library path/to/sfizz.dll \
+  --root path/to/instruments --pattern '*/*/presets/*.sfz' --output build/sfz-audit.json
+```

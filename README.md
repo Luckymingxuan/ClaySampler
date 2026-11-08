@@ -23,4 +23,6 @@ Use `--nvrtc` and `--sndfile` for explicit library paths, or set `CLAY_NVRTC` an
 
 Successful jobs print `OK` and write stereo PCM16 WAVs. Rejected MIDI jobs print `REJECT` with the input and reason. A batch containing rejected jobs returns exit status 2. A fatal setup error returns exit status 1.
 
+To check whether a preset loads and its sample headers resolve, run `claysampler --check-sfz preset.sfz`. The load check runs without a CUDA device or MIDI input. Place `--sndfile path` before the preset paths when an explicit decoder library is needed.
+
 [Architecture and upstream references](docs/architecture.md)

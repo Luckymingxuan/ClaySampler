@@ -207,7 +207,12 @@ struct BatchIndex {
     std::vector<Tile> tiles;
     std::vector<int> indices;
     std::vector<ControlPoint> controls;
+    std::vector<VoiceModulation> modulation;
+    std::vector<FilterTile> filterTiles;
+    std::vector<int> filterHeads;
     size_t frames = 0;
+    size_t filteredFrames = 0;
+    size_t pitchFrames = 0;
 
     void append(const RenderPlan& plan, int tileFrames)
     {
@@ -218,26 +223,59 @@ struct BatchIndex {
             --offsets[(voice.end - 1) / tileFrames + 1];
         }
         std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
-        int controlOffsets[4] = {static_cast<int>(controls.size())};
+        std::vector<int> controlOffsets(plan.controls.size() + 1);
+        controlOffsets[0] = static_cast<int>(controls.size());
         for (size_t i = 0; i < plan.controls.size(); ++i) {
             const auto& track = plan.controls[i];
             controls.insert(controls.end(), track.begin(), track.end());
             controlOffsets[i + 1] = static_cast<int>(controls.size());
         }
+        const auto modulationOffset = static_cast<int>(modulation.size());
+        for (auto binding : plan.modulation) {
+            if (binding.first >= 0) {
+                binding.last = controlOffsets[binding.first + 1];
+                binding.first = controlOffsets[binding.first];
+            }
+            if (binding.shapeFirst >= 0) {
+                binding.shapeLast = controlOffsets[binding.shapeFirst + 1];
+                binding.shapeFirst = controlOffsets[binding.shapeFirst];
+            }
+            modulation.push_back(binding);
+        }
         int indexCount = static_cast<int>(indices.size());
         for (int t = 0; t < count; ++t) {
             auto frame = t * tileFrames;
             Tile tile{frames + frame, frame, std::min(tileFrames, plan.frames - frame), indexCount, offsets[t], {}};
-            std::copy(std::begin(controlOffsets), std::end(controlOffsets), tile.controls);
+            std::copy_n(controlOffsets.begin(), 4, tile.controls);
             tiles.push_back(tile);
             indexCount += offsets[t];
             offsets[t] = tile.first;
         }
         indices.resize(indexCount);
-        for (const auto& voice : plan.spans) {
+        std::vector<int> tails(plan.filterTracks, -1);
+        for (auto voice : plan.spans) {
             const auto index = static_cast<int>(voices.size());
             for (int t = voice.begin / tileFrames; t <= (voice.end - 1) / tileFrames; ++t)
                 indices[offsets[t]++] = index;
+            voice.firstModulation += modulationOffset;
+            if (voice.filterTrack >= 0) {
+                auto& tail = tails[voice.filterTrack];
+                if (tail < 0)
+                    filterHeads.push_back(index);
+                else
+                    voices[tail].nextFilteredSpan = index;
+                tail = index;
+                voice.nextFilteredSpan = -1;
+                voice.filteredOffset = filteredFrames;
+                filteredFrames += voice.end - voice.begin;
+                if (voice.variablePitch) {
+                    voice.phaseOffset = pitchFrames;
+                    pitchFrames += voice.end - voice.begin;
+                }
+                std::copy_n(controlOffsets.begin(), 4, voice.filterControls);
+                for (int frame = voice.begin; frame < voice.end; frame += tileFrames)
+                    filterTiles.push_back({index, frame});
+            }
             voices.push_back(voice);
         }
         frames += plan.frames;
@@ -246,7 +284,10 @@ struct BatchIndex {
     size_t bytes() const
     {
         return voices.size() * sizeof(VoiceSpan) + tiles.size() * sizeof(Tile) +
-            indices.size() * sizeof(int) + controls.size() * sizeof(ControlPoint) + frames * 2 * sizeof(int16_t);
+            indices.size() * sizeof(int) + controls.size() * sizeof(ControlPoint) +
+            modulation.size() * sizeof(VoiceModulation) + frames * 2 * sizeof(int16_t) +
+            filterTiles.size() * sizeof(FilterTile) + filterHeads.size() * sizeof(int) +
+            filteredFrames * 2 * sizeof(float) + pitchFrames * sizeof(double);
     }
 };
 
@@ -260,7 +301,7 @@ struct Renderer::Impl {
         ~Context() { if (address) driver.destroy(address); }
     } context{driver};
     Buffer samples{driver}, sinc{driver};
-    Handle module{}, kernel{};
+    Handle module{}, kernel{}, filterSource{}, filterPass{}, pitchPass{};
     std::string deviceName;
     int threads{};
     size_t resident{}, peak{};
@@ -280,6 +321,9 @@ struct Renderer::Impl {
         auto code = compile(rtc, 10 * major + minor);
         driver.check(driver.load(&module, code.data()), "CUDA module");
         driver.check(driver.kernel(&kernel, module, "renderTiles"), "CUDA render kernel");
+        driver.check(driver.kernel(&filterSource, module, "renderFilterSources"), "CUDA filter source kernel");
+        driver.check(driver.kernel(&filterPass, module, "applyVoiceFilters"), "CUDA filter kernel");
+        driver.check(driver.kernel(&pitchPass, module, "prepareVoicePitch"), "CUDA variable pitch kernel");
         int minBlocks{};
         driver.check(driver.occupancy(&minBlocks, &threads, kernel, nullptr, 0, 256), "CUDA launch sizing");
         auto table = sincTable();
@@ -301,10 +345,19 @@ struct Renderer::Impl {
             const auto& plan = plans[job];
             size_t tiles = (size_t(plan.frames) + threads - 1) / threads;
             size_t bytes = size_t(plan.frames) * 4 + tiles * sizeof(Tile) + plan.spans.size() * sizeof(VoiceSpan);
-            for (const auto& span : plan.spans)
+            for (const auto& span : plan.spans) {
                 bytes += size_t((span.end - 1) / threads - span.begin / threads + 1) * sizeof(int);
+                if (span.filterTrack >= 0) {
+                    const size_t duration = span.end - span.begin;
+                    bytes += duration * 2 * sizeof(float) + ((duration + threads - 1) / threads) * sizeof(FilterTile);
+                    if (span.variablePitch)
+                        bytes += duration * sizeof(double);
+                }
+            }
+            bytes += plan.filterTracks * sizeof(int);
             for (const auto& track : plan.controls)
                 bytes += track.size() * sizeof(ControlPoint);
+            bytes += plan.modulation.size() * sizeof(VoiceModulation);
             if (bytes > budget - estimated)
                 break;
             index.append(plan, threads);
@@ -314,19 +367,51 @@ struct Renderer::Impl {
         if (!count)
             throw std::runtime_error("one render job exceeds the CUDA batch memory budget");
         peak = std::max(peak, resident + index.bytes());
-        Buffer voices(driver), tiles(driver), indices(driver), controls(driver), output(driver);
+        Buffer voices(driver), tiles(driver), indices(driver), controls(driver), modulation(driver), output(driver);
+        Buffer filterTiles(driver), filterHeads(driver), filtered(driver), phase(driver);
         voices.upload(index.voices);
         tiles.upload(index.tiles);
         indices.upload(index.indices);
         controls.upload(index.controls);
+        modulation.upload(index.modulation);
+        if (index.filteredFrames) {
+            filterTiles.upload(index.filterTiles);
+            filterHeads.upload(index.filterHeads);
+            filtered.allocate(index.filteredFrames * 2 * sizeof(float));
+        }
+        if (index.pitchFrames)
+            phase.allocate(index.pitchFrames * sizeof(double));
         output.allocate(index.frames * 4);
         TimingEvent begin(driver), end(driver);
         begin.record();
         const int countTiles = static_cast<int>(index.tiles.size());
         constexpr int launchTiles = 16384;
+        if (index.filteredFrames) {
+            int heads = static_cast<int>(index.filterHeads.size());
+            constexpr int filterThreads = 64;
+            const auto voiceBlocks = (heads + filterThreads - 1) / filterThreads;
+            if (index.pitchFrames) {
+                void* args[] = {&voices.address, &filterHeads.address, &controls.address, &modulation.address,
+                    &phase.address, &heads};
+                driver.check(driver.launch(pitchPass, voiceBlocks, 1, 1, filterThreads, 1, 1, 0,
+                    nullptr, args, nullptr), "CUDA variable pitch launch");
+            }
+            const int tileCount = static_cast<int>(index.filterTiles.size());
+            for (int offset = 0; offset < tileCount; offset += launchTiles) {
+                void* args[] = {&samples.address, &sinc.address, &voices.address, &filterTiles.address,
+                    &controls.address, &modulation.address, &phase.address, &filtered.address, &offset};
+                driver.check(driver.launch(filterSource, std::min(launchTiles, tileCount - offset), 1, 1,
+                    threads, 1, 1, 0, nullptr, args, nullptr), "CUDA filter source launch");
+            }
+            void* args[] = {&voices.address, &filterHeads.address, &controls.address, &modulation.address,
+                            &filtered.address, &heads};
+            driver.check(driver.launch(filterPass, voiceBlocks, 1, 1,
+                filterThreads, 1, 1, 0, nullptr, args, nullptr), "CUDA filter launch");
+        }
         for (int offset = 0; offset < countTiles; offset += launchTiles) {
             void* args[] = {&samples.address, &sinc.address, &voices.address, &tiles.address,
-                            &indices.address, &controls.address, &output.address, &offset};
+                            &indices.address, &controls.address, &modulation.address, &filtered.address,
+                            &output.address, &offset};
             driver.check(driver.launch(kernel, std::min(launchTiles, countTiles - offset), 1, 1,
                 threads, 1, 1, 0, nullptr, args, nullptr), "CUDA render launch");
         }
