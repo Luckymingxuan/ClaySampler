@@ -29,12 +29,14 @@ struct Voice {
     bool noteOff = false;
     VoiceKind kind;
     bool choked = false;
+    bool sostenuto = false;
     std::vector<int> flexShapes;
 };
 
 struct Release {
     int key, velocity, duration;
     const Region* region;
+    bool sostenuto;
 };
 
 struct Bend {
@@ -132,7 +134,8 @@ std::vector<Bend> bendTimeline(const Midi& midi)
 }
 
 template<class Transform>
-std::vector<ControlPoint> automation(const Midi& midi, int cc, float initial, int smoothFrames, Transform transform)
+std::vector<ControlPoint> automation(const Midi& midi, int cc, float initial, int smoothFrames,
+                                     Transform transform, bool settle = false)
 {
     float previous = transform(initial);
     std::vector<ControlPoint> points{{0, previous, 0}};
@@ -149,7 +152,9 @@ std::vector<ControlPoint> automation(const Midi& midi, int cc, float initial, in
         else if (event.kind == EventKind::control && event.a == cc) value = float(event.b);
         else continue;
         const auto target = transform(value);
-        if (target != previous) {
+        if (settle && event.frame == 0) {
+            points.front().value = target;
+        } else if (target != previous) {
             int first = std::max(last, event.frame / referenceBlock * referenceBlock);
             ramps.push_back({first, event.frame, previous, target});
         }
@@ -276,8 +281,8 @@ int voiceEnd(const VoiceSpan& voice, int envelopeEnd)
 
 class Planner {
 public:
-    Planner(const Instrument& instrument, AudioBank& bank, int rate, unsigned seed)
-        : instrument_(instrument), bank_(bank), rate_(rate), cc_(instrument.initialCC),
+    Planner(const Instrument& instrument, AudioBank& bank, int rate, unsigned seed, int limit, TailPolicy tail)
+        : instrument_(instrument), bank_(bank), rate_(rate), limit_(limit), tail_(tail), cc_(instrument.initialCC),
           sequence_(instrument.regions.size()), random_(seed), variation_(seed ^ 0x85ebca6b),
           currentSwitch_(instrument.initialSwitch)
     {
@@ -295,7 +300,7 @@ public:
             } else {
                 const auto curve = cc == 10 ? 1 : 4;
                 plan_.controls.push_back(automation(midi, cc, instrument_.initialCC[cc], rate_ / 100,
-                    [&](float value) { return curveValue(instrument_, curve, value); }));
+                    [&](float value) { return curveValue(instrument_, curve, value); }, tail_ == TailPolicy::natural));
             }
         }
         const auto bends = bendTimeline(midi);
@@ -312,15 +317,16 @@ public:
             }
         }
         prune(midi.end);
-        // Match the offline convention of releasing any still-held voices at EOF.
         for (auto& voice : active_) {
-            if (voice.kind == VoiceKind::attack && voice.region->loop != Loop::oneShot)
+            // Natural mode ends notes through the prepared MIDI and its pedal releases.
+            if (tail_ != TailPolicy::natural && voice.kind == VoiceKind::attack && voice.region->loop != Loop::oneShot)
                 release(voice, midi.end);
-            if (voice.span.end == forever)
+            if (voice.span.end == forever && limit_ == forever)
                 throw std::runtime_error("a looping one-shot or release sample has no finite end");
             emit(voice.span, voice.span.end);
         }
-        plan_.frames = std::max(plan_.frames, midi.end);
+        if (tail_ != TailPolicy::natural)
+            plan_.frames = std::max(plan_.frames, midi.end);
         if (plan_.spans.empty())
             throw std::runtime_error("no playable notes for this SFZ and MIDI");
         buildLfoTracks();
@@ -331,6 +337,8 @@ private:
     void emit(VoiceSpan span, int end)
     {
         span.end = std::min(span.end, end);
+        plan_.tailClipped |= span.end > limit_ && span.begin < span.end;
+        span.end = std::min(span.end, limit_);
         if (span.begin < span.end) {
             for (int i = span.firstLfo; i < span.firstLfo + span.lfoCount; ++i)
                 lfos_[i].end = std::max(lfos_[i].end, span.end);
@@ -455,7 +463,8 @@ private:
         auto result = tracks_.emplace(key, static_cast<int>(plan_.controls.size()));
         if (result.second) {
             plan_.controls.push_back(automation(*midi_, mod.cc, instrument_.initialCC[mod.cc],
-                mod.smooth * rate_ / 1000, [&](float value) { return curveValue(instrument_, mod.curve, value); }));
+                mod.smooth * rate_ / 1000, [&](float value) { return curveValue(instrument_, mod.curve, value); },
+                tail_ == TailPolicy::natural));
         }
         return result.first->second;
     }
@@ -469,7 +478,7 @@ private:
                 [&](float value) {
                     auto bend = std::max(-8191.f, value) / 8191;
                     return bend >= 0 ? bend * region.bendUp : -bend * region.bendDown;
-                }));
+                }, tail_ == TailPolicy::natural));
         }
         return result.first->second;
     }
@@ -480,7 +489,7 @@ private:
         auto result = fadeTracks_.emplace(key, static_cast<int>(plan_.controls.size()));
         if (result.second) {
             plan_.controls.push_back(automation(*midi_, cc, instrument_.initialCC[cc], rate_ / 200,
-                [&](float value) { return crossfadeGain(fade, value, true); }));
+                [&](float value) { return crossfadeGain(fade, value, true); }, tail_ == TailPolicy::natural));
         }
         return result.first->second;
     }
@@ -799,7 +808,8 @@ private:
         const auto noteGain = kind == VoiceKind::controller ? 1.f : velocityGain(r, velocity) *
             crossfadeGain(r.keyFade, key, false) * crossfadeGain(r.velocityFade, velocity, true);
         const auto gain = r.amplitude * noteGain *
-            std::pow(10.f, (masterGainDb + r.volume + vary(r.ampRandom) - r.releaseDecay * duration / rate_ + 3) / 20);
+            std::pow(10.f, ((tail_ == TailPolicy::natural ? 0 : masterGainDb) + r.volume +
+                vary(r.ampRandom) - r.releaseDecay * duration / rate_ + 3) / 20);
         constexpr float quarterPi = .7853981633974483f;
         constexpr float panCompensation = 1.4125375446227544f;
         const bool stereoMatrix = span.channels == 2 && (modulatedStereo || r.width != 1 || r.position != 0);
@@ -965,7 +975,7 @@ private:
         for (auto& voice : active_) {
             if (voice.key == event.a && voice.kind == VoiceKind::attack) {
                 voice.noteOff = true;
-                if (!pedal(*voice.region))
+                if (!pedal(*voice.region) && !voice.sostenuto)
                     release(voice, event.frame);
             }
         }
@@ -983,8 +993,8 @@ private:
             if ((r.trigger != Trigger::release && r.trigger != Trigger::releaseKey) ||
                 !sequenceMatches || !matches(r, velocity, draw))
                 continue;
-            if (r.trigger == Trigger::release && pedal(r)) {
-                delayed_.push_back({key, velocity, duration, &r});
+            if (r.trigger == Trigger::release && (pedal(r) || sostenutoKeys_[key])) {
+                delayed_.push_back({key, velocity, duration, &r, sostenutoKeys_[key]});
             } else if (r.trigger == Trigger::releaseKey || r.releaseDead || hasAttackVoice(r)) {
                 trigger(r, frame, key, velocity, VoiceKind::release, duration);
             }
@@ -1024,41 +1034,42 @@ private:
             const auto before = cc_;
             cc_ = instrument_.initialCC;
             updateDynamicEnvelopes(before, event.frame);
+            if (tail_ == TailPolicy::natural) {
+                setSostenuto(false);
+                releasePedals(event.frame, 66, before[66]);
+            }
             for (auto& voice : active_) {
                 if (voice.noteOff && !pedal(*voice.region))
                     release(voice, event.frame);
             }
             return;
         }
-        if (event.a == 66 && event.b != 0)
+        const bool natural = tail_ == TailPolicy::natural;
+        if (!natural && event.a == 66 && event.b != 0)
             throw std::runtime_error("unsupported MIDI sostenuto CC66");
+        if (natural && (event.a == 120 || event.a == 123)) {
+            for (auto& voice : active_)
+                emit(voice.span, event.frame);
+            active_.clear();
+            delayed_.clear();
+            down_.fill(false);
+            sostenutoKeys_.fill(false);
+            keysDown_ = 0;
+            return;
+        }
         if (event.a >= 120)
             throw std::runtime_error("unsupported MIDI channel mode CC" + std::to_string(event.a));
-        if (!instrument_.usedCC[event.a])
+        const bool sostenuto = natural && event.a == 66;
+        if (!instrument_.usedCC[event.a] && !sostenuto)
             return;
         const auto before = cc_;
         const auto previous = before[event.a];
         cc_[event.a] = static_cast<float>(event.b);
         if (previous != cc_[event.a])
             updateDynamicEnvelopes(before, event.frame);
-        for (auto& voice : active_) {
-            const auto& r = *voice.region;
-            if (voice.noteOff && r.sustainEnabled && r.sustainCC == event.a &&
-                previous >= r.sustainLow && !pedal(r))
-                release(voice, event.frame);
-        }
-        std::vector<Release> due;
-        auto end = std::remove_if(delayed_.begin(), delayed_.end(), [&](const Release& releaseNote) {
-            const auto& r = *releaseNote.region;
-            if (r.sustainCC != event.a || pedal(r))
-                return false;
-            if (r.releaseDead || hasAttackVoice(r))
-                due.push_back(releaseNote);
-            return true;
-        });
-        delayed_.erase(end, delayed_.end());
-        for (const auto& note : due)
-            trigger(*note.region, event.frame, note.key, note.velocity, VoiceKind::release, note.duration);
+        if (sostenuto)
+            setSostenuto(event.b == 127);
+        releasePedals(event.frame, event.a, previous);
         const auto& triggers = instrument_.byCC[event.a];
         if (triggers.empty())
             return;
@@ -1076,11 +1087,52 @@ private:
         }
     }
 
+    void setSostenuto(bool down)
+    {
+        if (sostenutoDown_ == down)
+            return;
+        sostenutoDown_ = down;
+        sostenutoKeys_ = down ? down_ : std::array<bool, 128>{};
+        for (auto& voice : active_)
+            voice.sostenuto = down && !voice.noteOff;
+        if (!down) {
+            for (auto& note : delayed_)
+                note.sostenuto = false;
+        }
+    }
+
+    void releasePedals(int frame, int cc, float previous)
+    {
+        const bool sostenutoUp = tail_ == TailPolicy::natural && cc == 66 && !sostenutoDown_;
+        for (auto& voice : active_) {
+            const auto& r = *voice.region;
+            const bool sustainChanged = r.sustainEnabled && r.sustainCC == cc && previous >= r.sustainLow;
+            if (voice.noteOff && (sustainChanged || sostenutoUp) && !pedal(r) && !voice.sostenuto)
+                release(voice, frame);
+        }
+        std::vector<Release> due;
+        auto end = std::remove_if(delayed_.begin(), delayed_.end(), [&](const Release& note) {
+            const auto& r = *note.region;
+            if ((r.sustainCC != cc && !sostenutoUp) || pedal(r) || note.sostenuto)
+                return false;
+            if (r.releaseDead || hasAttackVoice(r))
+                due.push_back(note);
+            return true;
+        });
+        delayed_.erase(end, delayed_.end());
+        for (const auto& note : due)
+            trigger(*note.region, frame, note.key, note.velocity, VoiceKind::release, note.duration);
+    }
+
     const Instrument& instrument_;
     AudioBank& bank_;
     int rate_;
+    int limit_;
+    TailPolicy tail_;
     std::array<float, 128> cc_;
     std::array<bool, 128> down_{};
+    std::array<bool, 128> sostenutoKeys_{};
+    bool sostenutoDown_ = false;
     std::array<int, 128> noteStart_{}, noteVelocity_{};
     std::vector<unsigned> sequence_;
     std::mt19937 random_, variation_;
@@ -1106,9 +1158,9 @@ private:
 } // namespace
 
 RenderPlan planRender(const Instrument& instrument, AudioBank& bank, const Midi& midi,
-                      int rate, unsigned seed)
+                      int rate, unsigned seed, int limit, TailPolicy tail)
 {
-    return Planner(instrument, bank, rate, seed).render(midi);
+    return Planner(instrument, bank, rate, seed, limit, tail).render(midi);
 }
 
 } // namespace clay

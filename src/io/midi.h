@@ -5,6 +5,8 @@
 
 namespace clay {
 
+enum class TailPolicy { natural, orig, custom };
+
 enum class EventKind { on, off, control, bend };
 
 struct Event {
@@ -19,6 +21,6 @@ struct Midi {
     int end = 0;
 };
 
-Midi loadMidi(const std::filesystem::path& path, int rate);
+Midi loadMidi(const std::filesystem::path& path, int rate, TailPolicy tail);
 
 } // namespace clay

@@ -7,6 +7,7 @@ add_executable(claysampler
     src/io/audio.cpp
     src/io/midi.cpp
     src/render/plan.cpp
+    src/render/tail.cpp
     src/cuda/renderer.cpp
 )
 set_target_properties(claysampler PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)

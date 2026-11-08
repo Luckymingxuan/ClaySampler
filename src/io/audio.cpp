@@ -107,13 +107,16 @@ const Sample& AudioBank::decode(int id)
     return sample;
 }
 
-Quality writeWave(const std::filesystem::path& path, const int16_t* pcm, int frames, int rate)
+Quality writeWave(const std::filesystem::path& path, const int16_t* pcm, int frames, int rate, int channels)
 {
-    if (frames <= 0 || static_cast<uint64_t>(frames) * 4 + 36 > UINT32_MAX)
+    const auto stride = channels * 2;
+    if (frames <= 0 || static_cast<uint64_t>(frames) * stride + 36 > UINT32_MAX)
         throw std::runtime_error("output exceeds PCM16 WAV limits");
     Quality quality{frames, 0, -1, -1};
     for (int i = 0; i < frames; ++i) {
-        const int peak = std::max(std::abs(int(pcm[2 * size_t(i)])), std::abs(int(pcm[2 * size_t(i) + 1])));
+        const auto* frame = pcm + channels * size_t(i);
+        const int peak = channels == 1 ? std::abs(int(frame[0])) :
+            std::max(std::abs(int(frame[0])), std::abs(int(frame[1])));
         quality.peak = std::max(quality.peak, peak);
         if (peak > 3) {
             if (quality.first < 0)
@@ -128,16 +131,16 @@ Quality writeWave(const std::filesystem::path& path, const int16_t* pcm, int fra
         for (int i = 0; i < bytes; ++i)
             file.put(static_cast<char>(value >> (8 * i)));
     };
-    const auto dataSize = static_cast<uint32_t>(frames) * 4;
+    const auto dataSize = static_cast<uint32_t>(frames) * stride;
     file.write("RIFF", 4);
     integer(dataSize + 36, 4);
     file.write("WAVEfmt ", 8);
     integer(16, 4);
     integer(1, 2);
-    integer(2, 2);
+    integer(channels, 2);
     integer(rate, 4);
-    integer(rate * 4, 4);
-    integer(4, 2);
+    integer(rate * stride, 4);
+    integer(stride, 2);
     integer(16, 2);
     file.write("data", 4);
     integer(dataSize, 4);

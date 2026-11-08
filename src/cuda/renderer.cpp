@@ -105,7 +105,7 @@ private:
     Driver& driver_;
 };
 
-std::vector<char> compile(const Path& library, int architecture)
+std::vector<char> compile(const Path& library, int architecture, bool floatingPoint)
 {
     Library rtc(library);
 #ifdef _WIN32
@@ -156,8 +156,8 @@ std::vector<char> compile(const Path& library, int architecture)
     } scope{program, destroy};
     auto archFlag = std::string(native ? "--gpu-architecture=sm_" : "--gpu-architecture=compute_") +
         std::to_string(target);
-    const char* flags[] = {archFlag.c_str(), "--std=c++17"};
-    if (run(program, 2, flags)) {
+    const char* flags[] = {archFlag.c_str(), "--std=c++17", floatingPoint ? "-DCLAY_FLOAT_OUTPUT=1" : "-DCLAY_FLOAT_OUTPUT=0"};
+    if (run(program, 3, flags)) {
         size_t bytes{};
         check(logSize(program, &bytes));
         std::vector<char> diagnostics(bytes);
@@ -281,11 +281,11 @@ struct BatchIndex {
         frames += plan.frames;
     }
 
-    size_t bytes() const
+    size_t bytes(size_t frameBytes) const
     {
         return voices.size() * sizeof(VoiceSpan) + tiles.size() * sizeof(Tile) +
             indices.size() * sizeof(int) + controls.size() * sizeof(ControlPoint) +
-            modulation.size() * sizeof(VoiceModulation) + frames * 2 * sizeof(int16_t) +
+            modulation.size() * sizeof(VoiceModulation) + frames * frameBytes +
             filterTiles.size() * sizeof(FilterTile) + filterHeads.size() * sizeof(int) +
             filteredFrames * 2 * sizeof(float) + pitchFrames * sizeof(double);
     }
@@ -304,9 +304,10 @@ struct Renderer::Impl {
     Handle module{}, kernel{}, filterSource{}, filterPass{}, pitchPass{};
     std::string deviceName;
     int threads{};
+    bool floatingPoint;
     size_t resident{}, peak{};
 
-    Impl(int ordinal, const Path& rtc)
+    Impl(int ordinal, const Path& rtc, bool outputFloat) : floatingPoint(outputFloat)
     {
         driver.check(driver.init(0), "CUDA initialization");
         int device{};
@@ -318,7 +319,7 @@ struct Renderer::Impl {
         driver.check(driver.attribute(&major, 75, device), "CUDA architecture major");
         driver.check(driver.attribute(&minor, 76, device), "CUDA architecture minor");
         driver.check(driver.create(&context.address, 0, device), "CUDA context");
-        auto code = compile(rtc, 10 * major + minor);
+        auto code = compile(rtc, 10 * major + minor, floatingPoint);
         driver.check(driver.load(&module, code.data()), "CUDA module");
         driver.check(driver.kernel(&kernel, module, "renderTiles"), "CUDA render kernel");
         driver.check(driver.kernel(&filterSource, module, "renderFilterSources"), "CUDA filter source kernel");
@@ -334,6 +335,7 @@ struct Renderer::Impl {
 
     RenderBatch render(const std::vector<RenderPlan>& plans, size_t first)
     {
+        const auto frameBytes = 2 * (floatingPoint ? sizeof(float) : sizeof(int16_t));
         size_t free{}, total{};
         driver.check(driver.memory(&free, &total), "CUDA free memory");
         // Leave headroom for other CUDA users and cap host PCM staging on large-memory GPUs.
@@ -344,7 +346,7 @@ struct Renderer::Impl {
         for (size_t job = first; job < plans.size(); ++job) {
             const auto& plan = plans[job];
             size_t tiles = (size_t(plan.frames) + threads - 1) / threads;
-            size_t bytes = size_t(plan.frames) * 4 + tiles * sizeof(Tile) + plan.spans.size() * sizeof(VoiceSpan);
+            size_t bytes = size_t(plan.frames) * frameBytes + tiles * sizeof(Tile) + plan.spans.size() * sizeof(VoiceSpan);
             for (const auto& span : plan.spans) {
                 bytes += size_t((span.end - 1) / threads - span.begin / threads + 1) * sizeof(int);
                 if (span.filterTrack >= 0) {
@@ -366,7 +368,7 @@ struct Renderer::Impl {
         }
         if (!count)
             throw std::runtime_error("one render job exceeds the CUDA batch memory budget");
-        peak = std::max(peak, resident + index.bytes());
+        peak = std::max(peak, resident + index.bytes(frameBytes));
         Buffer voices(driver), tiles(driver), indices(driver), controls(driver), modulation(driver), output(driver);
         Buffer filterTiles(driver), filterHeads(driver), filtered(driver), phase(driver);
         voices.upload(index.voices);
@@ -381,7 +383,8 @@ struct Renderer::Impl {
         }
         if (index.pitchFrames)
             phase.allocate(index.pitchFrames * sizeof(double));
-        output.allocate(index.frames * 4);
+        const auto outputBytes = index.frames * frameBytes;
+        output.allocate(outputBytes);
         TimingEvent begin(driver), end(driver);
         begin.record();
         const int countTiles = static_cast<int>(index.tiles.size());
@@ -416,8 +419,16 @@ struct Renderer::Impl {
                 threads, 1, 1, 0, nullptr, args, nullptr), "CUDA render launch");
         }
         end.record();
-        RenderBatch batch{std::unique_ptr<int16_t[]>(new int16_t[index.frames * 2]), count, 0};
-        driver.check(driver.get(batch.pcm.get(), output.address, index.frames * 4), "CUDA audio download");
+        RenderBatch batch{nullptr, nullptr, count, 0};
+        void* host;
+        if (floatingPoint) {
+            batch.stereo.reset(new float[index.frames * 2]);
+            host = batch.stereo.get();
+        } else {
+            batch.pcm.reset(new int16_t[index.frames * 2]);
+            host = batch.pcm.get();
+        }
+        driver.check(driver.get(host, output.address, outputBytes), "CUDA audio download");
         float milliseconds{};
         driver.check(driver.elapsedEvents(&milliseconds, begin.address, end.address), "CUDA kernel timing");
         batch.kernelSeconds = milliseconds / 1000.;
@@ -425,8 +436,8 @@ struct Renderer::Impl {
     }
 };
 
-Renderer::Renderer(int device, const Path& nvrtc)
-    : impl_(std::make_unique<Impl>(device, nvrtc))
+Renderer::Renderer(int device, const Path& nvrtc, bool floatingPoint)
+    : impl_(std::make_unique<Impl>(device, nvrtc, floatingPoint))
 {
 }
 
@@ -439,7 +450,10 @@ void Renderer::uploadSamples(const AudioBank& bank)
     impl_->peak = impl_->resident;
 }
 
-RenderBatch Renderer::render(const std::vector<RenderPlan>& plans, size_t first) { return impl_->render(plans, first); }
+RenderBatch Renderer::render(const std::vector<RenderPlan>& plans, size_t first)
+{
+    return impl_->render(plans, first);
+}
 const std::string& Renderer::device() const { return impl_->deviceName; }
 size_t Renderer::peakBytes() const { return impl_->peak; }
 

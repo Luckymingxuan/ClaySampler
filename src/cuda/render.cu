@@ -383,16 +383,10 @@ extern "C" __global__ void applyVoiceFilters(const VoiceSpan* voices, const int*
     }
 }
 
-extern "C" __global__ void renderTiles(const float* samples, const float* sinc, const VoiceSpan* voices,
-                                      const Tile* tiles, const int* indices, const ControlPoint* controls,
-                                      const VoiceModulation* modulation, const float2* filtered,
-                                      short2* output, int firstTile)
+__device__ float2 mixFrame(const float* samples, const float* sinc, const VoiceSpan* voices,
+                          const Tile& tile, const int* indices, const ControlPoint* controls,
+                          const VoiceModulation* modulation, const float2* filtered, int frame)
 {
-    const Tile tile = tiles[firstTile + blockIdx.x];
-    const auto lane = int(threadIdx.x);
-    if (lane >= tile.frames)
-        return;
-    const auto frame = tile.frame + lane;
     const auto pan = controlAt(controls, tile.controls[2], tile.controls[3], frame);
     float left = 0, right = 0, wetLeft = 0, wetRight = 0;
     for (int i = tile.first; i < tile.first + tile.count; ++i) {
@@ -421,6 +415,28 @@ extern "C" __global__ void renderTiles(const float* samples, const float* sinc, 
         }
     }
     const auto amplitude = jobGain(controls, tile.controls, frame);
-    output[tile.output + lane] = make_short2(pcm16(fmaf(left, amplitude, wetLeft)),
-                                            pcm16(fmaf(right, amplitude, wetRight)));
+    return make_float2(fmaf(left, amplitude, wetLeft), fmaf(right, amplitude, wetRight));
+}
+
+#if CLAY_FLOAT_OUTPUT
+using OutputFrame = float2;
+#else
+using OutputFrame = short2;
+#endif
+
+extern "C" __global__ void renderTiles(const float* samples, const float* sinc, const VoiceSpan* voices,
+                                      const Tile* tiles, const int* indices, const ControlPoint* controls,
+                                      const VoiceModulation* modulation, const float2* filtered,
+                                      OutputFrame* output, int firstTile)
+{
+    const Tile tile = tiles[firstTile + blockIdx.x];
+    const auto lane = int(threadIdx.x);
+    if (lane >= tile.frames)
+        return;
+    const auto mixed = mixFrame(samples, sinc, voices, tile, indices, controls, modulation, filtered, tile.frame + lane);
+#if CLAY_FLOAT_OUTPUT
+    output[tile.output + lane] = mixed;
+#else
+    output[tile.output + lane] = make_short2(pcm16(mixed.x), pcm16(mixed.y));
+#endif
 }

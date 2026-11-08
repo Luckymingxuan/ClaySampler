@@ -39,6 +39,6 @@ struct Quality {
     int last;
 };
 
-Quality writeWave(const std::filesystem::path& path, const int16_t* pcm, int frames, int rate);
+Quality writeWave(const std::filesystem::path& path, const int16_t* pcm, int frames, int rate, int channels = 2);
 
 } // namespace clay

@@ -12,9 +12,10 @@ struct RenderPlan {
     std::vector<VoiceModulation> modulation;
     int filterTracks = 0;
     int frames = 0;
+    bool tailClipped = false;
 };
 
 RenderPlan planRender(const Instrument& instrument, AudioBank& bank, const Midi& midi,
-                      int rate, unsigned seed);
+                      int rate, unsigned seed, int limit, TailPolicy tail);
 
 } // namespace clay

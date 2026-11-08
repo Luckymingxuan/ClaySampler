@@ -134,7 +134,7 @@ def baseline(binary, sfz, midis, output, passes, workers):
 
 def cuda(options, sfz, midis, output):
     command = [options.clay, "--sfz", sfz, "--output", output, "--samplerate", str(RATE),
-               "--passes", str(options.passes)]
+               "--passes", str(options.passes), "--tail-policy", "orig"]
     for name in ("nvrtc", "sndfile", "device"):
         value = getattr(options, name)
         if value is not None:

@@ -4,8 +4,8 @@
 
 1. The SFZ loader resolves paths and inherited parameters, reads sample metadata, and indexes regions by key and triggering MIDI CC. MIDI files become frame-ordered event streams.
 2. The CPU walks the sparse MIDI events, tracks keyswitches and controllers, resolves triggers and voice choking, and describes each active voice as one or more spans with source positions and envelope parameters. It builds compact automation tracks for MIDI controls, LFOs and supported flexible pitch envelopes. Sample PCM is decoded only for regions that actually trigger in the batch, then uploaded once.
-3. Each CUDA block renders a tile of one output. Threads run 48-tap Kaiser-windowed sinc interpolation, blend loop crossfades, evaluate envelopes, and mix channels with the requested stereo width and position. Voices with variable pitch get a CUDA phase pass before interpolation. Filters and EQ keep causal state per voice in a CUDA pass after the parallel source rendering. These passes keep state across spans and share the batch memory budget. The final tile pass combines contributions and quantizes to PCM16.
-4. The host retrieves the batch, checks for non-silent PCM, and writes WAV files. The batch API uses whole render jobs. The host does not advance the audio by synchronizing after each tile.
+3. Each CUDA block renders a tile of one output. Threads run 48-tap Kaiser-windowed sinc interpolation, blend loop crossfades, evaluate envelopes, and mix channels with the requested stereo width and position. Voices with variable pitch get a CUDA phase pass before interpolation. Filters and EQ keep causal state per voice in a CUDA pass after the parallel source rendering. These passes keep state across spans and share the batch memory budget. The final tile pass outputs float stereo for `natural` or quantizes directly to stereo PCM16 for `orig` and `custom`.
+4. The host downloads a batch once. For `natural`, it finds the first quiet block after the last performance event and applies ClayEngine's mono tail finishing rules. Samples after the last planned voice are treated as zero without allocating GPU tiles for that padding. The host checks the final PCM and writes the WAV. `custom` bounds voice spans in the planner before launching CUDA.
 
 ## Device behavior
 
@@ -16,6 +16,8 @@ One process renders one SFZ preset at a time. The whole set of samples reference
 ## Upstream references
 
 ClaySampler uses its own parser, MIDI event planner, batch layout, and CUDA implementation. We used sfizz 1.2.3 as the reference for observable behavior, including its windowed-sinc approach, default CC mappings and master gain, envelope curves, and bend interpolation. The implementation does not include sfizz source or link sfizz at runtime. The comparison harness invokes the reference CLI separately. libsndfile is loaded as an external runtime dependency.
+
+ClayEngine's `instruments/midi_render.py` and `instruments/render_tail.py` are the behavioral references for `natural`. ClaySampler prepares the events in memory and uses its CUDA mix, with host-side analysis for the float stop criterion and PCM16 mono finishing.
 
 - [sfizz 1.2.3](https://github.com/sfztools/sfizz/releases/tag/1.2.3)
 - [sfizz 1.2.3 BSD-2-Clause license](https://github.com/sfztools/sfizz/blob/1.2.3/LICENSE)
