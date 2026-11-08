@@ -1,2 +1,26 @@
 # ClaySampler
-Unleashing GPU power for lightning-fast audio synthesis.
+
+ClaySampler renders batches of MIDI files through an SFZ instrument on NVIDIA CUDA GPUs. It targets offline audio generation, with sfizz 1.2.3 as the compatibility and quality reference.
+
+The current implementation covers a tested SFZ subset. See [compatibility](docs/compatibility.md) for accepted features and [validation](docs/validation.md) for the sfizz benchmark and listening report.
+
+## Build and render
+
+Build with CMake 3.20 or newer and a C++17 compiler. At runtime the executable needs an NVIDIA driver, NVRTC with its matching builtins library, and libsndfile. The executable contains the CUDA source and compiles it for the selected GPU. Python is used only by the comparison harness.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+```
+
+Run the built `claysampler` executable. Pass as many MIDI paths as needed for the same preset. Output files use the MIDI basename.
+
+```sh
+claysampler --sfz instrument.sfz --output renders take1.mid take2.mid
+```
+
+Use `--nvrtc` and `--sndfile` for explicit library paths, or set `CLAY_NVRTC` and `CLAY_SNDFILE`. The Windows defaults are `nvrtc64_120_0.dll` and `libsndfile-1.dll`. On Linux they are `libnvrtc.so` and `libsndfile.so.1`. Use `--device` for a different CUDA ordinal and `--samplerate` to change the default of 44,100 Hz.
+
+Successful jobs print `OK` and write stereo PCM16 WAVs. Rejected MIDI jobs print `REJECT` with the input and reason. A batch containing rejected jobs returns exit status 2. A fatal setup error returns exit status 1.
+
+[Architecture and upstream references](docs/architecture.md)
