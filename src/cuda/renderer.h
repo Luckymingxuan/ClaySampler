@@ -9,15 +9,14 @@
 namespace clay {
 
 struct RenderBatch {
-    std::unique_ptr<int16_t[]> pcm;
-    std::unique_ptr<float[]> stereo;
-    size_t count;
-    double kernelSeconds;
+    std::shared_ptr<int16_t> pcm;
+    std::vector<TailResult> results;
+    double kernelSeconds = 0;
 };
 
 class Renderer {
 public:
-    Renderer(int device, const std::filesystem::path& nvrtc, bool floatingPoint);
+    Renderer(int device, const std::filesystem::path& nvrtc, bool natural, int rate);
     ~Renderer();
     void uploadSamples(const AudioBank& bank);
     RenderBatch render(const std::vector<RenderPlan>& plans, size_t first);

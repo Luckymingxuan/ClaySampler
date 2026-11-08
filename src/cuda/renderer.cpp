@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <thread>
 #include <vector>
 
 namespace clay {
@@ -36,6 +37,9 @@ struct Driver {
     int (*free)(DevicePtr) = lib.get<int(*)(DevicePtr)>("cuMemFree_v2");
     int (*put)(DevicePtr, const void*, size_t) = lib.get<int(*)(DevicePtr, const void*, size_t)>("cuMemcpyHtoD_v2");
     int (*get)(void*, DevicePtr, size_t) = lib.get<int(*)(void*, DevicePtr, size_t)>("cuMemcpyDtoH_v2");
+    int (*copy)(DevicePtr, DevicePtr, size_t) = lib.get<int(*)(DevicePtr, DevicePtr, size_t)>("cuMemcpyDtoD_v2");
+    int (*allocHost)(void**, size_t) = lib.get<int(*)(void**, size_t)>("cuMemAllocHost_v2");
+    int (*freeHost)(void*) = lib.get<int(*)(void*)>("cuMemFreeHost");
     using Occupancy = int(*)(int*, int*, Handle, size_t(*)(int), size_t, int);
     Occupancy occupancy = lib.get<Occupancy>("cuOccupancyMaxPotentialBlockSize");
     using Launch = int(*)(Handle, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
@@ -82,13 +86,26 @@ private:
 class Buffer {
 public:
     explicit Buffer(Driver& driver) : driver_(driver) {}
-    ~Buffer() { if (address) driver_.free(address); }
+    ~Buffer() { reset(); }
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
 
     void allocate(size_t bytes)
     {
-        driver_.check(driver_.allocate(&address, std::max(bytes, size_t{1})), "CUDA allocation");
+        bytes = std::max(bytes, size_t{1});
+        if (bytes <= capacity)
+            return;
+        reset();
+        driver_.check(driver_.allocate(&address, bytes), "CUDA allocation");
+        capacity = bytes;
+    }
+
+    void reset()
+    {
+        if (address)
+            driver_.free(address);
+        address = 0;
+        capacity = 0;
     }
 
     template<class T> void upload(const std::vector<T>& data)
@@ -100,25 +117,63 @@ public:
     }
 
     DevicePtr address{};
+    size_t capacity{};
 
 private:
     Driver& driver_;
 };
 
+struct HostPcm {
+    Driver& driver;
+    void* address{};
+    size_t capacity{};
+
+    explicit HostPcm(Driver& owner) : driver(owner) {}
+    ~HostPcm() { if (address) driver.freeHost(address); }
+    bool reserve(size_t bytes)
+    {
+        if (bytes <= capacity)
+            return true;
+        if (address)
+            driver.freeHost(address);
+        address = nullptr;
+        capacity = 0;
+        void* allocation{};
+        if (driver.allocHost(&allocation, bytes))
+            return false;
+        address = allocation;
+        capacity = bytes;
+        return true;
+    }
+};
+
+struct ArenaLayout {
+    size_t bytes = 0;
+
+    size_t section(size_t size)
+    {
+        constexpr size_t alignment = 16;
+        const auto offset = (bytes + alignment - 1) & ~(alignment - 1);
+        bytes = offset + size;
+        return offset;
+    }
+};
+
+size_t blocksFor(size_t frames, size_t block) { return (frames + block - 1) / block; }
+
 std::vector<char> compile(const Path& library, int architecture, bool floatingPoint)
 {
     Library rtc(library);
+    const auto version = rtc.get<int(*)(int*, int*)>("nvrtcVersion");
+    int major{}, minor{};
+    const bool hasVersion = version(&major, &minor) == 0;
 #ifdef _WIN32
     std::unique_ptr<Library> builtins;
-    if (library.has_parent_path()) {
-        auto version = rtc.get<int(*)(int*, int*)>("nvrtcVersion");
-        int major{}, minor{};
-        if (!version(&major, &minor)) {
-            auto filename = "nvrtc-builtins64_" + std::to_string(major) + std::to_string(minor) + ".dll";
-            auto path = std::filesystem::absolute(library).parent_path() / filename;
-            if (std::filesystem::exists(path))
-                builtins = std::make_unique<Library>(path);
-        }
+    if (library.has_parent_path() && hasVersion) {
+        auto filename = "nvrtc-builtins64_" + std::to_string(major) + std::to_string(minor) + ".dll";
+        auto path = std::filesystem::absolute(library).parent_path() / filename;
+        if (std::filesystem::exists(path))
+            builtins = std::make_unique<Library>(path);
     }
 #endif
     auto create = rtc.get<int(*)(Handle*, const char*, const char*, int, const char* const*, const char* const*)>("nvrtcCreateProgram");
@@ -156,8 +211,11 @@ std::vector<char> compile(const Path& library, int architecture, bool floatingPo
     } scope{program, destroy};
     auto archFlag = std::string(native ? "--gpu-architecture=sm_" : "--gpu-architecture=compute_") +
         std::to_string(target);
-    const char* flags[] = {archFlag.c_str(), "--std=c++17", floatingPoint ? "-DCLAY_FLOAT_OUTPUT=1" : "-DCLAY_FLOAT_OUTPUT=0"};
-    if (run(program, 3, flags)) {
+    const bool parallel = hasVersion && (major > 12 || (major == 12 && minor >= 4)) &&
+        std::thread::hardware_concurrency() >= 4;
+    const char* flags[] = {archFlag.c_str(), "--std=c++17", floatingPoint ? "-DCLAY_FLOAT_OUTPUT=1" : "-DCLAY_FLOAT_OUTPUT=0",
+        "--split-compile=4"};
+    if (run(program, parallel ? 4 : 3, flags)) {
         size_t bytes{};
         check(logSize(program, &bytes));
         std::vector<char> diagnostics(bytes);
@@ -281,14 +339,6 @@ struct BatchIndex {
         frames += plan.frames;
     }
 
-    size_t bytes(size_t frameBytes) const
-    {
-        return voices.size() * sizeof(VoiceSpan) + tiles.size() * sizeof(Tile) +
-            indices.size() * sizeof(int) + controls.size() * sizeof(ControlPoint) +
-            modulation.size() * sizeof(VoiceModulation) + frames * frameBytes +
-            filterTiles.size() * sizeof(FilterTile) + filterHeads.size() * sizeof(int) +
-            filteredFrames * 2 * sizeof(float) + pitchFrames * sizeof(double);
-    }
 };
 
 } // namespace
@@ -300,14 +350,20 @@ struct Renderer::Impl {
         Handle address{};
         ~Context() { if (address) driver.destroy(address); }
     } context{driver};
-    Buffer samples{driver}, sinc{driver};
+    Buffer samples{driver}, sinc{driver}, arena{driver};
+    std::vector<std::shared_ptr<HostPcm>> hostPcm;
     Handle module{}, kernel{}, filterSource{}, filterPass{}, pitchPass{};
+    Handle stereoScan{}, nativeEnd{}, monoQuantize{}, trimEnd{}, pcmLayout{}, pcmFinalize{};
     std::string deviceName;
     int threads{};
-    bool floatingPoint;
-    size_t resident{}, peak{};
+    bool natural;
+    TailConfig tail;
+    size_t uploaded{}, peak{};
 
-    Impl(int ordinal, const Path& rtc, bool outputFloat) : floatingPoint(outputFloat)
+    Impl(int ordinal, const Path& rtc, bool useNatural, int rate)
+        : natural(useNatural), tail{int(std::nearbyint(rate / 20.)), 2 * rate,
+            int(std::nearbyint(rate / 4.)), int(std::nearbyint(rate / 10.)), std::pow(10., -1.5),
+            32768 * std::pow(10., -3.9), 32768 * std::pow(10., -3.)}
     {
         driver.check(driver.init(0), "CUDA initialization");
         int device{};
@@ -319,34 +375,114 @@ struct Renderer::Impl {
         driver.check(driver.attribute(&major, 75, device), "CUDA architecture major");
         driver.check(driver.attribute(&minor, 76, device), "CUDA architecture minor");
         driver.check(driver.create(&context.address, 0, device), "CUDA context");
-        auto code = compile(rtc, 10 * major + minor, floatingPoint);
+        auto code = compile(rtc, 10 * major + minor, natural);
         driver.check(driver.load(&module, code.data()), "CUDA module");
         driver.check(driver.kernel(&kernel, module, "renderTiles"), "CUDA render kernel");
         driver.check(driver.kernel(&filterSource, module, "renderFilterSources"), "CUDA filter source kernel");
         driver.check(driver.kernel(&filterPass, module, "applyVoiceFilters"), "CUDA filter kernel");
         driver.check(driver.kernel(&pitchPass, module, "prepareVoicePitch"), "CUDA variable pitch kernel");
+        driver.check(driver.kernel(&pcmLayout, module, "layoutPcm"), "CUDA PCM layout kernel");
+        driver.check(driver.kernel(&pcmFinalize, module, "finalizePcm"), "CUDA PCM finalization kernel");
+        if (natural) {
+            driver.check(driver.kernel(&stereoScan, module, "scanStereo"), "CUDA stereo statistics kernel");
+            driver.check(driver.kernel(&nativeEnd, module, "selectNative"), "CUDA natural endpoint kernel");
+            driver.check(driver.kernel(&monoQuantize, module, "quantizeMono"), "CUDA mono conversion kernel");
+            driver.check(driver.kernel(&trimEnd, module, "selectTrim"), "CUDA trim endpoint kernel");
+        }
         int minBlocks{};
         driver.check(driver.occupancy(&minBlocks, &threads, kernel, nullptr, 0, 256), "CUDA launch sizing");
         auto table = sincTable();
         sinc.upload(table);
-        resident = table.size() * sizeof(float);
-        peak = resident;
+        peak = sinc.capacity;
+    }
+
+    void uploadSamples(const AudioBank& bank)
+    {
+        const auto bytes = bank.pcm.size() * sizeof(float);
+        if (bytes <= uploaded && samples.address)
+            return;
+        if (bytes > samples.capacity || !samples.address) {
+            size_t free{}, total{};
+            driver.check(driver.memory(&free, &total), "CUDA free memory");
+            const size_t slack = std::min(bytes / 2, size_t{128} * 1024 * 1024);
+            Buffer replacement(driver);
+            DevicePtr candidate{};
+            const auto capacity = std::max(bytes + slack, size_t{1});
+            if (capacity <= free && !driver.allocate(&candidate, capacity)) {
+                replacement.address = candidate;
+                replacement.capacity = capacity;
+                peak = std::max(peak, sinc.capacity + arena.capacity + samples.capacity + replacement.capacity);
+                if (uploaded)
+                    driver.check(driver.copy(replacement.address, samples.address, uploaded), "CUDA sample bank growth");
+                std::swap(samples.address, replacement.address);
+                std::swap(samples.capacity, replacement.capacity);
+            } else {
+                arena.reset();
+                samples.allocate(bytes);
+                uploaded = 0;
+            }
+        }
+        if (bytes > uploaded)
+            driver.check(driver.put(samples.address + uploaded, bank.pcm.data() + uploaded / sizeof(float),
+                bytes - uploaded), "CUDA sample upload");
+        uploaded = bytes;
+        peak = std::max(peak, sinc.capacity + samples.capacity + arena.capacity);
+    }
+
+    std::shared_ptr<int16_t> receivePcm(DevicePtr source, size_t samplesCount)
+    {
+        if (!samplesCount)
+            return {};
+        const auto bytes = samplesCount * sizeof(int16_t);
+        std::shared_ptr<int16_t> pcm;
+        // Bound locked host memory and retain each slot until its WAV writer finishes.
+        if (bytes <= 128 * size_t{1024} * 1024) {
+            auto slot = std::find_if(hostPcm.begin(), hostPcm.end(), [](const auto& item) { return item.use_count() == 1; });
+            if (slot == hostPcm.end() && hostPcm.size() < 3)
+                slot = hostPcm.insert(slot, std::make_shared<HostPcm>(driver));
+            if (slot != hostPcm.end() && (*slot)->reserve(bytes))
+                pcm = std::shared_ptr<int16_t>(*slot, static_cast<int16_t*>((*slot)->address));
+        }
+        if (!pcm)
+            pcm = std::shared_ptr<int16_t>(new int16_t[samplesCount], std::default_delete<int16_t[]>());
+        driver.check(driver.get(pcm.get(), source, bytes), "CUDA PCM download");
+        return pcm;
+    }
+
+    template<class... Args>
+    void launchChunks(Handle function, int blocks, int width, Args&... args)
+    {
+        constexpr int launchBlocks = 16384;
+        for (int offset = 0; offset < blocks; offset += launchBlocks) {
+            void* arguments[] = {&args..., &offset};
+            driver.check(driver.launch(function, std::min(launchBlocks, blocks - offset), 1, 1,
+                width, 1, 1, 0, nullptr, arguments, nullptr), "CUDA block launch");
+        }
     }
 
     RenderBatch render(const std::vector<RenderPlan>& plans, size_t first)
     {
-        const auto frameBytes = 2 * (floatingPoint ? sizeof(float) : sizeof(int16_t));
+        const auto frameBytes = 2 * (natural ? sizeof(float) : sizeof(int16_t));
         size_t free{}, total{};
         driver.check(driver.memory(&free, &total), "CUDA free memory");
-        // Leave headroom for other CUDA users and cap host PCM staging on large-memory GPUs.
-        const size_t budget = std::min(free / 2, size_t{512} * 1024 * 1024);
-        size_t count = 0;
+        constexpr size_t mib = 1024 * 1024;
+        const auto available = free + arena.capacity;
+        const auto budget = std::min(available / 2, std::clamp(total / 12, 512 * mib, 1024 * mib));
+        const auto singleJobBudget = std::min(available - available / 3, budget + budget / 3);
         size_t estimated = 0;
         BatchIndex index;
+        std::vector<TailJob> jobs;
+        int blocks = 0, windows = 0;
         for (size_t job = first; job < plans.size(); ++job) {
             const auto& plan = plans[job];
-            size_t tiles = (size_t(plan.frames) + threads - 1) / threads;
+            const auto tiles = blocksFor(plan.frames, threads);
+            const auto jobBlocks = int(blocksFor(plan.frames, tailBlockFrames));
+            const auto jobWindows = natural ? int(blocksFor(plan.frames, tail.window)) : 0;
             size_t bytes = size_t(plan.frames) * frameBytes + tiles * sizeof(Tile) + plan.spans.size() * sizeof(VoiceSpan);
+            bytes += sizeof(TailJob) + sizeof(TailResult) + 256;
+            if (natural)
+                bytes += size_t(plan.frames) * sizeof(int16_t) + jobBlocks * sizeof(StereoStats) +
+                    jobWindows * sizeof(MonoStats);
             for (const auto& span : plan.spans) {
                 bytes += size_t((span.end - 1) / threads - span.begin / threads + 1) * sizeof(int);
                 if (span.filterTrack >= 0) {
@@ -360,75 +496,87 @@ struct Renderer::Impl {
             for (const auto& track : plan.controls)
                 bytes += track.size() * sizeof(ControlPoint);
             bytes += plan.modulation.size() * sizeof(VoiceModulation);
-            if (bytes > budget - estimated)
+            const auto limit = jobs.empty() && natural ? singleJobBudget : budget;
+            if (estimated >= limit || bytes > limit - estimated)
                 break;
+            jobs.push_back({index.frames, plan.frames, plan.musicEnd, plan.limit, plan.fadeFrames, blocks, windows});
             index.append(plan, threads);
             estimated += bytes;
-            ++count;
+            blocks += jobBlocks;
+            windows += jobWindows;
         }
-        if (!count)
+        if (jobs.empty())
             throw std::runtime_error("one render job exceeds the CUDA batch memory budget");
-        peak = std::max(peak, resident + index.bytes(frameBytes));
-        Buffer voices(driver), tiles(driver), indices(driver), controls(driver), modulation(driver), output(driver);
-        Buffer filterTiles(driver), filterHeads(driver), filtered(driver), phase(driver);
-        voices.upload(index.voices);
-        tiles.upload(index.tiles);
-        indices.upload(index.indices);
-        controls.upload(index.controls);
-        modulation.upload(index.modulation);
-        if (index.filteredFrames) {
-            filterTiles.upload(index.filterTiles);
-            filterHeads.upload(index.filterHeads);
-            filtered.allocate(index.filteredFrames * 2 * sizeof(float));
-        }
-        if (index.pitchFrames)
-            phase.allocate(index.pitchFrames * sizeof(double));
-        const auto outputBytes = index.frames * frameBytes;
-        output.allocate(outputBytes);
+        int count = static_cast<int>(jobs.size());
+        ArenaLayout layout;
+        const auto reserve = [&](const auto& items) { return layout.section(items.size() * sizeof(items.front())); };
+        const auto voiceOffset = reserve(index.voices), tileOffset = reserve(index.tiles), indexOffset = reserve(index.indices);
+        const auto controlOffset = reserve(index.controls), modulationOffset = reserve(index.modulation);
+        const auto filterTileOffset = reserve(index.filterTiles), filterHeadOffset = reserve(index.filterHeads);
+        const auto filteredOffset = layout.section(index.filteredFrames * 2 * sizeof(float));
+        const auto phaseOffset = layout.section(index.pitchFrames * sizeof(double));
+        const auto mixOffset = layout.section(index.frames * frameBytes);
+        const auto jobOffset = reserve(jobs), resultOffset = layout.section(count * sizeof(TailResult));
+        const auto monoBytes = natural ? index.frames * sizeof(int16_t) : 0;
+        const auto monoOffset = layout.section(monoBytes);
+        const auto statsOffset = layout.section(natural ? blocks * sizeof(StereoStats) : 0);
+        const auto windowOffset = layout.section(windows * sizeof(MonoStats));
+        arena.allocate(layout.bytes);
+        peak = std::max(peak, sinc.capacity + samples.capacity + arena.capacity);
+        const auto upload = [&](size_t offset, const auto& items) {
+            auto address = arena.address + offset;
+            if (!items.empty())
+                driver.check(driver.put(address, items.data(), items.size() * sizeof(items.front())), "CUDA batch upload");
+            return address;
+        };
+        auto voices = upload(voiceOffset, index.voices), tiles = upload(tileOffset, index.tiles);
+        auto indices = upload(indexOffset, index.indices), controls = upload(controlOffset, index.controls);
+        auto modulation = upload(modulationOffset, index.modulation), jobData = upload(jobOffset, jobs);
+        auto filterTiles = upload(filterTileOffset, index.filterTiles), filterHeads = upload(filterHeadOffset, index.filterHeads);
+        auto filtered = arena.address + filteredOffset, phase = arena.address + phaseOffset;
+        auto mix = arena.address + mixOffset, resultData = arena.address + resultOffset;
+        auto mono = natural ? arena.address + monoOffset : mix;
+        // After mono conversion the float mix is dead, so its allocation also holds the compact PCM.
+        auto packed = mix;
         TimingEvent begin(driver), end(driver);
         begin.record();
-        const int countTiles = static_cast<int>(index.tiles.size());
-        constexpr int launchTiles = 16384;
         if (index.filteredFrames) {
             int heads = static_cast<int>(index.filterHeads.size());
             constexpr int filterThreads = 64;
             const auto voiceBlocks = (heads + filterThreads - 1) / filterThreads;
             if (index.pitchFrames) {
-                void* args[] = {&voices.address, &filterHeads.address, &controls.address, &modulation.address,
-                    &phase.address, &heads};
+                void* args[] = {&voices, &filterHeads, &controls, &modulation, &phase, &heads};
                 driver.check(driver.launch(pitchPass, voiceBlocks, 1, 1, filterThreads, 1, 1, 0,
                     nullptr, args, nullptr), "CUDA variable pitch launch");
             }
-            const int tileCount = static_cast<int>(index.filterTiles.size());
-            for (int offset = 0; offset < tileCount; offset += launchTiles) {
-                void* args[] = {&samples.address, &sinc.address, &voices.address, &filterTiles.address,
-                    &controls.address, &modulation.address, &phase.address, &filtered.address, &offset};
-                driver.check(driver.launch(filterSource, std::min(launchTiles, tileCount - offset), 1, 1,
-                    threads, 1, 1, 0, nullptr, args, nullptr), "CUDA filter source launch");
-            }
-            void* args[] = {&voices.address, &filterHeads.address, &controls.address, &modulation.address,
-                            &filtered.address, &heads};
+            launchChunks(filterSource, int(index.filterTiles.size()), threads, samples.address, sinc.address,
+                voices, filterTiles, controls, modulation, phase, filtered);
+            void* args[] = {&voices, &filterHeads, &controls, &modulation, &filtered, &heads};
             driver.check(driver.launch(filterPass, voiceBlocks, 1, 1,
                 filterThreads, 1, 1, 0, nullptr, args, nullptr), "CUDA filter launch");
         }
-        for (int offset = 0; offset < countTiles; offset += launchTiles) {
-            void* args[] = {&samples.address, &sinc.address, &voices.address, &tiles.address,
-                            &indices.address, &controls.address, &modulation.address, &filtered.address,
-                            &output.address, &offset};
-            driver.check(driver.launch(kernel, std::min(launchTiles, countTiles - offset), 1, 1,
-                threads, 1, 1, 0, nullptr, args, nullptr), "CUDA render launch");
+        launchChunks(kernel, int(index.tiles.size()), threads, samples.address, sinc.address, voices, tiles,
+            indices, controls, modulation, filtered, mix);
+        if (natural) {
+            auto stats = arena.address + statsOffset, windowStats = arena.address + windowOffset;
+            launchChunks(stereoScan, blocks, 128, jobData, count, mix, stats);
+            void* nativeArgs[] = {&jobData, &count, &mix, &stats, &resultData};
+            driver.check(driver.launch(nativeEnd, (count + 31) / 32, 1, 1, 32, 1, 1, 0,
+                nullptr, nativeArgs, nullptr), "CUDA native endpoint launch");
+            launchChunks(monoQuantize, windows, 256, jobData, count, mix, resultData, mono, windowStats, tail.window);
+            void* trimArgs[] = {&jobData, &count, &windowStats, &resultData, &tail};
+            driver.check(driver.launch(trimEnd, (count + 31) / 32, 1, 1, 32, 1, 1, 0,
+                nullptr, trimArgs, nullptr), "CUDA tail trim launch");
         }
+        void* layoutArgs[] = {&jobData, &count, &resultData};
+        driver.check(driver.launch(pcmLayout, 1, 1, 1, 1, 1, 1, 0, nullptr, layoutArgs, nullptr), "CUDA PCM layout launch");
+        launchChunks(pcmFinalize, blocks, 128, jobData, count, mono, packed, resultData);
         end.record();
-        RenderBatch batch{nullptr, nullptr, count, 0};
-        void* host;
-        if (floatingPoint) {
-            batch.stereo.reset(new float[index.frames * 2]);
-            host = batch.stereo.get();
-        } else {
-            batch.pcm.reset(new int16_t[index.frames * 2]);
-            host = batch.pcm.get();
-        }
-        driver.check(driver.get(host, output.address, outputBytes), "CUDA audio download");
+        RenderBatch batch;
+        batch.results.resize(count);
+        driver.check(driver.get(batch.results.data(), resultData, count * sizeof(TailResult)), "CUDA tail metadata download");
+        const auto& last = batch.results.back();
+        batch.pcm = receivePcm(packed, (last.offset + last.dataFrames) * (natural ? 1 : 2));
         float milliseconds{};
         driver.check(driver.elapsedEvents(&milliseconds, begin.address, end.address), "CUDA kernel timing");
         batch.kernelSeconds = milliseconds / 1000.;
@@ -436,8 +584,8 @@ struct Renderer::Impl {
     }
 };
 
-Renderer::Renderer(int device, const Path& nvrtc, bool floatingPoint)
-    : impl_(std::make_unique<Impl>(device, nvrtc, floatingPoint))
+Renderer::Renderer(int device, const Path& nvrtc, bool natural, int rate)
+    : impl_(std::make_unique<Impl>(device, nvrtc, natural, rate))
 {
 }
 
@@ -445,9 +593,7 @@ Renderer::~Renderer() = default;
 
 void Renderer::uploadSamples(const AudioBank& bank)
 {
-    impl_->samples.upload(bank.pcm);
-    impl_->resident += bank.pcm.size() * sizeof(float);
-    impl_->peak = impl_->resident;
+    impl_->uploadSamples(bank);
 }
 
 RenderBatch Renderer::render(const std::vector<RenderPlan>& plans, size_t first)

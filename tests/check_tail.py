@@ -47,7 +47,7 @@ def check(options, root):
             raise AssertionError(result.stdout + result.stderr)
         return output, result
 
-    natural, _ = render("default")
+    natural, natural_log = render("default")
     explicit, _ = render("natural", "--tail-policy", "natural")
     natural_wave = natural / "source.wav"
     assert natural_wave.read_bytes() == (explicit / "source.wav").read_bytes()
@@ -55,6 +55,10 @@ def check(options, root):
     assert (channels, frames) == (1, round(.65 * RATE))
     assert struct.unpack_from("<h", samples, (frames - 5000) * 2)[0] > 3
     assert samples[-2:] == b"\0\0"
+    peaks = [abs(value) for (value,) in struct.iter_unpack("<h", samples)]
+    audible = [i for i, peak in enumerate(peaks) if peak > 3]
+    qc = next(line.split("\t")[2:] for line in natural_log.stdout.splitlines() if line.startswith("OK\t"))
+    assert list(map(int, qc)) == [frames, max(peaks), audible[0], audible[-1]]
 
     orig, _ = render("orig", "--tail-policy", "orig")
     assert read_wav(orig / "source.wav")[:2] == (2, round(5.1 * RATE))
@@ -90,6 +94,12 @@ def check(options, root):
     assert read_wav(pedals / "later.wav")[1] > read_wav(pedals / "held.wav")[1] + RATE // 4
     assert read_wav(pedals / "held.wav")[1] % 1024 == 0
 
+    processed = root / "processed.sfz"
+    processed.write_text(loop.read_text(encoding="ascii").strip()
+                         + " fil_type=lpf_2p cutoff=1200 lfo1_freq=3 lfo1_pitch=120\n", encoding="ascii")
+    filtered, _ = render("filtered", inputs=(regular, later), preset=processed)
+    assert (filtered / "regular.wav").read_bytes() != (pedals / "regular.wav").read_bytes()
+
     hot = root / "hot.sfz"
     centered = sfz.read_text(encoding="ascii").strip() + " pan_oncc10=0"
     hot.write_text(centered + " volume=33\n", encoding="ascii")
@@ -100,6 +110,28 @@ def check(options, root):
     hot.write_text(centered + " volume=42\n", encoding="ascii")
     rejected, result = render("too-hot", preset=hot, expected=2)
     assert "excessive_peak" in result.stderr and not (rejected / "source.wav").exists()
+
+    short_sample = root / "short.wav"
+    with wave.open(str(short_sample), "wb") as stream:
+        stream.setparams((1, 2, RATE, 0, "NONE", "not compressed"))
+        stream.writeframes(struct.pack("<h", 1600) * (RATE * 2 // 5))
+    short_preset = root / "short.sfz"
+    short_preset.write_text(sfz.read_text(encoding="ascii").replace("sample.wav", "short.wav"), encoding="ascii")
+    gap = root / "gap.mid"
+    midi(gap, bytes.fromhex("00 90 3c 64 8b 20 80 3c 00 00 ff 2f 00"))
+    padded, _ = render("padded", inputs=(gap,), preset=short_preset)
+    channels, frames, pcm = read_wav(padded / "gap.wav")
+    assert (channels, frames) == (1, 65 * 1024)
+    assert not any(pcm[(RATE * 2 // 5) * 2:])
+
+    many = [root / f"batch-{i}.mid" for i in range(66)]
+    for path in many:
+        path.write_bytes(regular.read_bytes())
+    many[64].write_bytes(b"invalid MIDI")
+    output, result = render("pipeline", "--passes", "2", inputs=many, preset=short_preset, expected=2)
+    assert len(list(output.glob("*.wav"))) == 65
+    assert sum(line.startswith("OK\t") for line in result.stdout.splitlines()) == 130
+    assert (output / "batch-0.wav").read_bytes() == (output / "batch-65.wav").read_bytes()
 
 
 def main():

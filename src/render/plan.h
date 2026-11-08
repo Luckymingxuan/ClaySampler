@@ -12,6 +12,7 @@ struct RenderPlan {
     std::vector<VoiceModulation> modulation;
     int filterTracks = 0;
     int frames = 0;
+    int musicEnd = 0, limit = 0, fadeFrames = 0;
     bool tailClipped = false;
 };
 

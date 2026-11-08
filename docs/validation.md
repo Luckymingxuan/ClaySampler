@@ -19,7 +19,7 @@ Use `--nvrtc`, `--sndfile`, and `--device` to pass runtime options to ClaySample
 - Cold CUDA includes preset metadata, CUDA context, NVRTC compilation, sample decode and upload, render, download, WAV write and quality check. Warm CUDA reuses the sample bank and module. The sfizz repeat timing still starts a fresh process per MIDI. The OS file cache is left in place for both renderers.
 - A pair passes the automatic comparison when onset and last audible frame are within 12 ms and 80 ms, integrated energy is within 0.5 dB, relative waveform error is at most 18% after one sub-ms global alignment, and clipping does not materially increase. The tail check uses a threshold of 16 PCM16 units (about -66 dBFS). The report also records the end delta at three units.
 - Synthetic cases cover velocity layers, repeated notes, pedal, bend and CC automation. The harness accepts held-out MIDI via `--midi`. Review the original WAVs in the A/B page to judge audible changes that these checks do not capture.
-- Peak CUDA allocations refer to sample storage, the sinc table, and explicitly allocated render buffers. They exclude the driver and context. CUDA kernel time is recorded separately.
+- Peak CUDA allocations cover sample storage, the sinc table, and explicitly allocated device buffers. CUDA event timing covers synthesis and GPU finishing. Planning and upload measurements can overlap initialization, rendering, and WAV writing. Use pass wall time for throughput comparisons.
 
 ## First recorded run (`aedaa4d`)
 
@@ -52,7 +52,23 @@ Pass `--nvrtc` and `--sndfile` for explicit runtime library paths.
 
 On the RTX 4080 Laptop GPU, `orig` reproduced all 36 clarinet and piano WAVs byte for byte against the executable from `cba2724`. Against ClayEngine's sfizz 1.2.3 path, `natural` matched the frame count for all 36 clips. The final frame above 16 PCM16 units differed by at most two samples. The separate long weak-tail fixture reached the same 1.050 s output duration on both paths, from a 4.040 s reference native render.
 
-For batches of 18 clips, median warm times over three passes were 0.181 s for clarinet and 0.222 s for piano in `natural`, compared with 0.113 s and 0.150 s in `orig`. These timings include WAV writeout. ClayEngine's 16-worker reference took 1.80 s and 6.18 s respectively, including its per-clip MIDI preparation and sfizz setup.
+At `7a4598e`, for batches of 18 clips, median warm times over three passes were 0.181 s for clarinet and 0.222 s for piano in `natural`, compared with 0.113 s and 0.150 s in `orig`. These timings include WAV writeout. ClayEngine's 16-worker reference took 1.80 s and 6.18 s respectively, including its per-clip MIDI preparation and sfizz setup.
+
+## CUDA finishing pipeline
+
+The comparison uses real MIDI from the ClayEngine VCSL v3 manifests, the same preset and `natural` arguments on both binaries, and the RTX 4080 Laptop GPU with NVRTC 12.4. The baseline is `7a4598e`. Warm values are medians of ten passes across two invocations per binary, after the first pass in each invocation. Cold values are medians of three fresh processes and include startup and WAV writing. The operating system's file cache was kept between runs.
+
+| Workload | Baseline warm | Pipeline warm | Baseline cold | Pipeline cold |
+|---|---:|---:|---:|---:|
+| Steinway B, 1 clip | 0.022 s | 0.007 s | 0.986 s | 0.858 s |
+| Steinway B, 16 clips | 0.420 s | 0.116 s | 1.768 s | 1.081 s |
+| Steinway B, 63 clips | 1.669 s | 0.308 s | 3.494 s | 1.649 s |
+| Concert Harp, 16 clips | 1.582 s | 1.194 s | | |
+| Marimba, 16 clips | 1.236 s | 0.900 s | | |
+
+The performance workloads produced byte-identical WAVs against the baseline. The 36 clarinet and piano regression clips matched byte for byte in both `natural` and `orig`. The generated CLI checks cover custom fade, peak repair, weak-tail trim, silent padding, filtered pitch modulation, and a rejected MIDI across repeated batches. NVRTC 12.4 compiled both kernel variants for `sm_75`, `sm_86`, `sm_89`, and `compute_90`.
+
+The 63-clip piano warm CUDA interval grew from 0.179 s to 0.199 s, including GPU tail finishing. The total pass fell from 1.669 s to 0.308 s. Peak explicit device allocations rose from 1196 MiB to 1471 MiB. The host download now carries mono PCM16 at two bytes per copied frame in `natural`, compared with eight bytes for the prior stereo float path.
 
 ## Preset audit
 

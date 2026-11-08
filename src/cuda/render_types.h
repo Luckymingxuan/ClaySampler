@@ -76,3 +76,28 @@ struct VoiceModulation {
 struct FilterTile {
     int span, frame;
 };
+
+constexpr int tailBlockFrames = 1024;
+constexpr int naturalTailLimitSeconds = 120;
+
+struct TailJob {
+    unsigned long long offset;
+    int frames, musicEnd, limit, fade, blockFirst, windowFirst;
+};
+
+struct TailConfig {
+    int window, quietFrames, padding, fade;
+    double relative, floor, ceiling;
+};
+
+enum class TailStatus { ok, duration, nonfinite, peak };
+
+struct TailResult {
+    unsigned long long offset;
+    int frames, dataFrames, fade, peak, first, last;
+    TailStatus status;
+    float scale;
+};
+
+struct StereoStats { double power; float peak; };
+struct MonoStats { double power; int peak; };

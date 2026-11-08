@@ -1,16 +1,19 @@
 #include "cuda/renderer.h"
-#include "render/tail.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cwctype>
+#include <deque>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -144,18 +147,106 @@ int checkPresets(int argc, Char** argv)
     return rejected ? 2 : 0;
 }
 
+struct PlannedBatch {
+    std::vector<clay::RenderPlan> plans;
+    std::shared_ptr<std::vector<Path>> outputs = std::make_shared<std::vector<Path>>();
+    std::vector<std::string> rejected;
+    size_t next = 0;
+    double seconds = 0;
+};
+
+PlannedBatch planBatch(const Options& options, const clay::Instrument& instrument, clay::AudioBank& bank, size_t first)
+{
+    const auto start = Clock::now();
+    const bool natural = options.tail == clay::TailPolicy::natural;
+    const int customFade = static_cast<int>(std::lround(options.tailFadeMs.value_or(100) * (options.rate / 1000.)));
+    PlannedBatch batch;
+    const auto count = std::min(size_t{64}, options.midi.size() - first);
+    batch.plans.reserve(count);
+    batch.outputs->reserve(count);
+    size_t frames = 0;
+    batch.next = first;
+    // Give the CUDA and WAV stages work before planning the entire invocation.
+    for (; batch.next - first < count && frames < 24 * size_t{1024} * 1024;
+         ++batch.next) {
+        const auto& path = options.midi[batch.next];
+        try {
+            auto midi = clay::loadMidi(path, options.rate, options.tail);
+            const int musicEnd = midi.end + 1;
+            int limit = std::numeric_limits<int>::max();
+            if (natural) {
+                limit = musicEnd + naturalTailLimitSeconds * options.rate;
+                if (options.maxAudio)
+                    limit = std::min(limit, static_cast<int>(std::floor(*options.maxAudio * options.rate)));
+                if (limit < musicEnd)
+                    throw std::runtime_error("natural render exceeds the audio duration limit");
+            } else if (options.tailMax) {
+                limit = musicEnd + static_cast<int>(std::floor(*options.tailMax * options.rate));
+            }
+            auto plan = clay::planRender(instrument, bank, midi, options.rate, 1, limit, options.tail);
+            plan.musicEnd = musicEnd;
+            plan.limit = limit;
+            if (options.tail == clay::TailPolicy::custom && plan.tailClipped && plan.frames == limit)
+                plan.fadeFrames = std::min(customFade, std::max(0, plan.frames - musicEnd));
+            auto name = path.stem();
+            name += ".wav";
+            batch.outputs->push_back(options.output / name);
+            frames += plan.frames;
+            batch.plans.push_back(std::move(plan));
+        } catch (const std::exception& error) {
+            batch.rejected.push_back("REJECT\t" + path.u8string() + '\t' + error.what() + '\n');
+        }
+    }
+    batch.seconds = elapsed(start);
+    return batch;
+}
+
+const char* tailError(TailStatus status)
+{
+    switch (status) {
+    case TailStatus::duration: return "natural tail exceeded the tail or audio duration limit";
+    case TailStatus::nonfinite: return "natural render produced non-finite audio";
+    case TailStatus::peak: return "excessive_peak: natural render requires more than 5 dB attenuation";
+    case TailStatus::ok: return nullptr;
+    }
+    return "unknown CUDA tail status";
+}
+
+struct WrittenBatch {
+    size_t passed = 0;
+    std::string ok, rejected;
+};
+
+WrittenBatch writeBatch(const clay::RenderBatch& batch, const std::vector<Path>& outputs, size_t first,
+                        int rate, int channels)
+{
+    std::ostringstream ok, rejected;
+    size_t passed = 0;
+    for (size_t i = 0; i < batch.results.size(); ++i) {
+        const auto& result = batch.results[i];
+        const auto& path = outputs[first + i];
+        try {
+            if (const auto* error = tailError(result.status))
+                throw std::runtime_error(error);
+            if (result.last < 0)
+                throw std::runtime_error("rendered audio is silent " + path.u8string());
+            clay::writeWave(path, batch.pcm.get() + result.offset * channels, result.dataFrames, result.frames, rate, channels);
+            ok << "OK\t" << path.filename().u8string() << '\t' << result.frames
+               << '\t' << result.peak << '\t' << result.first << '\t' << result.last << '\n';
+            ++passed;
+        } catch (const std::exception& error) {
+            rejected << "REJECT\t" << path.u8string() << '\t' << error.what() << '\n';
+        }
+    }
+    return {passed, ok.str(), rejected.str()};
+}
+
 int run(const Options& options)
 {
     const bool natural = options.tail == clay::TailPolicy::natural;
-    const int customFade = static_cast<int>(std::lround(options.tailFadeMs.value_or(100) * (options.rate / 1000.)));
+    const int channels = natural ? 1 : 2;
     auto start = Clock::now();
     clay::AudioBank bank(options.sndfile);
-    auto instrument = clay::loadInstrument(options.sfz, bank);
-    clay::Renderer renderer(options.device, options.nvrtc, natural);
-    const auto initialization = elapsed(start);
-    std::cout << "DEVICE\t" << renderer.device() << '\n'
-              << "INIT\t" << initialization << '\n';
-    std::filesystem::create_directories(options.output);
     std::set<Path> names;
     for (const auto& path : options.midi) {
         auto name = path.stem();
@@ -168,72 +259,64 @@ int run(const Options& options)
         if (!names.insert(name).second)
             throw std::runtime_error("duplicate output basename " + path.stem().u8string());
     }
+    auto opening = std::async(std::launch::async, [&] {
+        auto instrument = clay::loadInstrument(options.sfz, bank);
+        auto first = planBatch(options, instrument, bank, 0);
+        return std::make_pair(std::move(instrument), std::move(first));
+    });
+    clay::Renderer renderer(options.device, options.nvrtc, natural, options.rate);
+    auto startup = opening.get();
+    const auto& instrument = startup.first;
+    std::cout << "DEVICE\t" << renderer.device() << '\n'
+              << "INIT\t" << elapsed(start) << '\n';
+    std::filesystem::create_directories(options.output);
     size_t passed = 0;
-    struct Output {
-        Path path;
-        int musicEnd, limit;
-    };
     for (int pass = 1; pass <= options.passes; ++pass) {
         auto passStart = Clock::now();
-        std::vector<clay::RenderPlan> plans;
-        std::vector<Output> outputs;
-        for (const auto& path : options.midi) {
-            try {
-                auto midi = clay::loadMidi(path, options.rate, options.tail);
-                const int musicEnd = midi.end + 1;
-                int limit = std::numeric_limits<int>::max();
-                if (natural) {
-                    limit = musicEnd + clay::naturalTailLimitSeconds * options.rate;
-                    if (options.maxAudio)
-                        limit = std::min(limit, static_cast<int>(std::floor(*options.maxAudio * options.rate)));
-                    if (limit < musicEnd)
-                        throw std::runtime_error("natural render exceeds the audio duration limit");
-                } else if (options.tailMax) {
-                    limit = musicEnd + static_cast<int>(std::floor(*options.tailMax * options.rate));
-                }
-                auto plan = clay::planRender(instrument, bank, midi, options.rate, 1, limit, options.tail);
-                auto name = path.stem();
-                name += ".wav";
-                outputs.push_back({options.output / name, musicEnd, limit});
-                plans.push_back(std::move(plan));
-            } catch (const std::exception& error) {
-                std::cerr << "REJECT\t" << path.u8string() << '\t' << error.what() << '\n';
-            }
-        }
-        if (pass == 1 && !plans.empty())
-            renderer.uploadSamples(bank);
-        const auto preparation = elapsed(passStart);
-        double kernelSeconds = 0;
+        double preparation = 0, kernelSeconds = 0;
         passed = 0;
-        for (size_t first = 0; first < plans.size();) {
-            auto batch = renderer.render(plans, first);
-            kernelSeconds += batch.kernelSeconds;
-            size_t offset = 0;
-            for (size_t i = first; i < first + batch.count; ++i) {
-                const auto& plan = plans[i];
-                const auto& output = outputs[i];
-                try {
-                    clay::Quality qc;
-                    if (natural) {
-                        qc = clay::writeNaturalTail(output.path, batch.stereo.get() + offset, plan.frames,
-                            output.musicEnd, output.limit, options.rate);
-                    } else {
-                        auto* pcm = batch.pcm.get() + offset;
-                        if (options.tail == clay::TailPolicy::custom && plan.tailClipped && plan.frames == output.limit)
-                            clay::fadeTail(pcm, plan.frames, 2,
-                                std::min(customFade, std::max(0, plan.frames - output.musicEnd)));
-                        qc = clay::writeWave(output.path, pcm, plan.frames, options.rate);
-                    }
-                    std::cout << "OK\t" << output.path.filename().u8string() << '\t' << qc.frames
-                              << '\t' << qc.peak << '\t' << qc.first << '\t' << qc.last << '\n';
-                    ++passed;
-                } catch (const std::exception& error) {
-                    std::cerr << "REJECT\t" << output.path.u8string() << '\t' << error.what() << '\n';
-                }
-                offset += size_t(plan.frames) * 2;
+        const auto prefetch = [&](size_t next) {
+            return std::async(std::launch::async, [&, next] { return planBatch(options, instrument, bank, next); });
+        };
+        auto group = pass == 1 ? std::move(startup.second) : planBatch(options, instrument, bank, 0);
+        std::future<PlannedBatch> next;
+        std::deque<std::future<WrittenBatch>> writers;
+        const auto drain = [&] {
+            auto pending = std::move(writers.front());
+            writers.pop_front();
+            const auto result = pending.get();
+            passed += result.passed;
+            std::cout << result.ok;
+            std::cerr << result.rejected;
+        };
+        for (;;) {
+            for (const auto& line : group.rejected)
+                std::cerr << line;
+            const auto uploadStart = Clock::now();
+            if (!group.plans.empty())
+                renderer.uploadSamples(bank);
+            preparation += group.seconds + elapsed(uploadStart);
+            // Only the planner can grow the host bank, and the CUDA thread already uploaded this group's samples.
+            if (group.next < options.midi.size())
+                next = prefetch(group.next);
+            for (size_t first = 0; first < group.plans.size();) {
+                if (writers.size() >= 3)
+                    drain();
+                auto batch = renderer.render(group.plans, first);
+                kernelSeconds += batch.kernelSeconds;
+                const auto count = batch.results.size();
+                writers.push_back(std::async(std::launch::async,
+                    [batch = std::move(batch), outputs = group.outputs, first, rate = options.rate, channels] {
+                        return writeBatch(batch, *outputs, first, rate, channels);
+                    }));
+                first += count;
             }
-            first += batch.count;
+            if (!next.valid())
+                break;
+            group = next.get();
         }
+        while (!writers.empty())
+            drain();
         std::cout << "PASS\t" << pass << '\t' << elapsed(passStart) << '\t' << passed << '\t'
                   << renderer.peakBytes() << '\t' << preparation << '\t' << kernelSeconds << '\n';
     }

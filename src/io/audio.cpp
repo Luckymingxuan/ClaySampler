@@ -107,25 +107,12 @@ const Sample& AudioBank::decode(int id)
     return sample;
 }
 
-Quality writeWave(const std::filesystem::path& path, const int16_t* pcm, int frames, int rate, int channels)
+void writeWave(const std::filesystem::path& path, const int16_t* pcm, int dataFrames, int frames,
+               int rate, int channels)
 {
     const auto stride = channels * 2;
-    if (frames <= 0 || static_cast<uint64_t>(frames) * stride + 36 > UINT32_MAX)
+    if (frames <= 0 || dataFrames < 0 || dataFrames > frames || static_cast<uint64_t>(frames) * stride + 36 > UINT32_MAX)
         throw std::runtime_error("output exceeds PCM16 WAV limits");
-    Quality quality{frames, 0, -1, -1};
-    for (int i = 0; i < frames; ++i) {
-        const auto* frame = pcm + channels * size_t(i);
-        const int peak = channels == 1 ? std::abs(int(frame[0])) :
-            std::max(std::abs(int(frame[0])), std::abs(int(frame[1])));
-        quality.peak = std::max(quality.peak, peak);
-        if (peak > 3) {
-            if (quality.first < 0)
-                quality.first = i;
-            quality.last = i;
-        }
-    }
-    if (quality.first < 0)
-        throw std::runtime_error("rendered audio is silent " + path.u8string());
     std::ofstream file(path, std::ios::binary);
     auto integer = [&](uint32_t value, int bytes) {
         for (int i = 0; i < bytes; ++i)
@@ -144,11 +131,17 @@ Quality writeWave(const std::filesystem::path& path, const int16_t* pcm, int fra
     integer(16, 2);
     file.write("data", 4);
     integer(dataSize, 4);
-    file.write(reinterpret_cast<const char*>(pcm), dataSize);
+    if (dataFrames)
+        file.write(reinterpret_cast<const char*>(pcm), size_t(dataFrames) * stride);
+    static constexpr char silence[16384]{};
+    for (auto remaining = size_t(frames - dataFrames) * stride; remaining;) {
+        const auto count = std::min(remaining, sizeof(silence));
+        file.write(silence, count);
+        remaining -= count;
+    }
     file.close();
     if (!file)
         throw std::runtime_error("cannot write WAV " + path.u8string());
-    return quality;
 }
 
 } // namespace clay

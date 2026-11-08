@@ -32,13 +32,7 @@ private:
     Decoder* decoder_;
 };
 
-struct Quality {
-    int frames;
-    int peak;
-    int first;
-    int last;
-};
-
-Quality writeWave(const std::filesystem::path& path, const int16_t* pcm, int frames, int rate, int channels = 2);
+void writeWave(const std::filesystem::path& path, const int16_t* pcm, int dataFrames, int frames,
+               int rate, int channels);
 
 } // namespace clay
