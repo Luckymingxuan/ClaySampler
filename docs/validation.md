@@ -21,7 +21,7 @@ Use `--nvrtc`, `--sndfile`, and `--device` to pass runtime options to ClaySample
 - Synthetic cases cover velocity layers, repeated notes, pedal, bend and CC automation. The harness accepts held-out MIDI via `--midi`. Review the original WAVs in the A/B page to judge audible changes that these checks do not capture.
 - Peak CUDA allocations refer to sample storage, the sinc table, and explicitly allocated render buffers. They exclude the driver and context. CUDA kernel time is recorded separately.
 
-## First recorded run
+## First recorded run (`aedaa4d`)
 
 Windows x86-64, RTX 4080 Laptop GPU, NVRTC 12.4. Each preset used 16 generated cases and two held-out GigaMIDI clips. All 36 pairs passed the automatic checks. The largest integrated-energy difference was under 0.004 dB and the largest tail difference at the 16-unit threshold was 11.4 ms.
 
@@ -31,3 +31,5 @@ Windows x86-64, RTX 4080 Laptop GPU, NVRTC 12.4. Each preset used 16 generated c
 | VCSL Grand Piano Steinway B | 5.661 s | 1.350 s | 5.413 s | 0.130 s | 0.034 s | 915 MiB |
 
 These are whole-batch timings for the stated workloads. The same kernel also compiled for `sm_75`, `sm_86`, `sm_89` and `compute_90` with NVRTC 12.4. Audio and performance were measured on the RTX 4080 Laptop GPU.
+
+The subsequent compatibility work reran the 36 audio comparisons. See [compatibility](compatibility.md#additional-audio-checks) for those results and the additional preset checks.

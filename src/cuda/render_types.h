@@ -5,10 +5,12 @@ struct VoiceSpan {
     double position;
     double step;
     double pitchSlope;
-    int channels, begin, end, sourceEnd, loopFirst, loopEnd;
+    int channels, begin, end, sourceEnd, loopFirst, loopEnd, loopCrossfade;
+    int stereoMatrix;
     int attackStart, holdStart, decayStart, releaseStart, fadeStart, bendEnd;
     float gain, pan, left, right, start, attackStep, decayRate, sustain, releaseValue, releaseRate;
     float fadeValue, fadeStep;
+    float widthDirect, widthCross, positionLeft, positionRight;
 };
 
 struct Tile {

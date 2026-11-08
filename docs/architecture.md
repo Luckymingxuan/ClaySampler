@@ -2,9 +2,9 @@
 
 ## Data flow
 
-1. The SFZ loader resolves paths and inherited parameters, reads sample metadata, and indexes regions by key. MIDI files become frame-ordered event streams.
-2. The CPU walks the sparse MIDI events, resolves triggers and controllers, and describes each active voice as one or more spans with source positions and envelope parameters. This avoids tracking voice state in a sequential kernel and exposes independent frames and jobs to CUDA. Sample PCM is decoded only for regions that actually trigger in the batch, then uploaded once.
-3. Each CUDA block renders a tile of one output. The tile contains indices into just the voice spans that overlap it. Threads advance the source phase, run 48-tap Kaiser-windowed sinc interpolation, evaluate envelopes, mix channels, apply the instrument's default MIDI controller curves, and quantize to PCM16. Integer source positions use a direct fetch.
+1. The SFZ loader resolves paths and inherited parameters, reads sample metadata, and indexes regions by key and triggering MIDI CC. MIDI files become frame-ordered event streams.
+2. The CPU walks the sparse MIDI events, tracks keyswitches and controllers, resolves triggers and voice choking, and describes each active voice as one or more spans with source positions and envelope parameters. This avoids tracking voice state in a sequential kernel and exposes independent frames and jobs to CUDA. Sample PCM is decoded only for regions that actually trigger in the batch, then uploaded once.
+3. Each CUDA block renders a tile of one output. The tile contains indices into just the voice spans that overlap it. Threads advance the source phase, run 48-tap Kaiser-windowed sinc interpolation, blend loop crossfades, and evaluate envelopes. They mix channels with the requested stereo width and position, apply the instrument's default MIDI controller curves, and quantize to PCM16. Integer source positions use a direct fetch.
 4. The host retrieves the batch, checks for non-silent PCM, and writes WAV files. The batch API uses whole render jobs. The host does not advance the audio by synchronizing after each tile.
 
 ## Device behavior

@@ -26,23 +26,14 @@ __device__ float2 fetch(const float* samples, const VoiceSpan& voice, int frame)
     return make_float2(left, voice.channels == 1 ? left : samples[index + 1]);
 }
 
-__device__ float2 interpolate(const float* samples, const float* sinc, const VoiceSpan& voice, int frame)
+__device__ float2 interpolateAt(const float* samples, const float* sinc, const VoiceSpan& voice, double pos)
 {
-    const auto elapsed = frame - voice.begin;
-    double distance = elapsed;
-    if (voice.pitchSlope != 0)
-        distance = expm1(voice.pitchSlope * elapsed) / expm1(voice.pitchSlope);
-    double pos = voice.position + distance * voice.step;
-    bool wrapped = voice.loopEnd > 0 && pos >= voice.loopEnd;
-    int period = voice.loopEnd - voice.loopFirst;
-    if (wrapped)
-        pos = voice.loopFirst + fmod(pos - voice.loopFirst, double(period));
     const auto center = __double2int_rd(pos);
     if (pos == center)
         return fetch(samples, voice, center);
     const int phase = __double2int_rn((pos - center) * phases);
     float2 result = make_float2(0, 0);
-    if (voice.loopEnd <= 0 && center >= 23 && center < voice.sourceEnd - 24) {
+    if (center >= 23 && center < voice.sourceEnd - 24) {
         auto index = voice.sample + static_cast<unsigned long long>(center - 23) * voice.channels;
         if (voice.channels == 1) {
             #pragma unroll 8
@@ -59,18 +50,35 @@ __device__ float2 interpolate(const float* samples, const float* sinc, const Voi
         }
     } else {
         for (int tap = 0; tap < taps; ++tap) {
-            int source = center - 23 + tap;
-            if (voice.loopEnd > 0 && (source >= voice.loopEnd || (wrapped && source < voice.loopFirst))) {
-                auto remainder = (source - voice.loopFirst) % period;
-                source = voice.loopFirst + (remainder < 0 ? remainder + period : remainder);
-            }
-            auto sample = fetch(samples, voice, source);
+            auto sample = fetch(samples, voice, center - 23 + tap);
             auto weight = sinc[tap * (phases + 1) + phase];
             result.x = fmaf(weight, sample.x, result.x);
             result.y = fmaf(weight, sample.y, result.y);
         }
     }
     return result;
+}
+
+__device__ float2 interpolate(const float* samples, const float* sinc, const VoiceSpan& voice, int frame)
+{
+    const auto elapsed = frame - voice.begin;
+    double distance = elapsed;
+    if (voice.pitchSlope != 0)
+        distance = expm1(voice.pitchSlope * elapsed) / expm1(voice.pitchSlope);
+    double pos = voice.position + distance * voice.step;
+    const int period = voice.loopEnd - voice.loopFirst;
+    if (voice.loopEnd > 0 && pos >= voice.loopEnd)
+        pos = voice.loopFirst + fmod(pos - voice.loopFirst, double(period));
+    auto sample = interpolateAt(samples, sinc, voice, pos);
+    const int fadeStart = voice.loopEnd - voice.loopCrossfade;
+    if (voice.loopEnd > 0 && voice.loopCrossfade > 0 && pos >= fadeStart) {
+        auto entry = interpolateAt(samples, sinc, voice, pos - period);
+        auto phase = float((pos - fadeStart) / voice.loopCrossfade);
+        auto blend = .5f - .5f * cosf(3.14159265358979323846f * phase);
+        sample.x = fmaf(blend, entry.x - sample.x, sample.x);
+        sample.y = fmaf(blend, entry.y - sample.y, sample.y);
+    }
+    return sample;
 }
 
 __device__ short pcm16(float value)
@@ -120,8 +128,15 @@ extern "C" __global__ void renderTiles(const float* samples, const float* sinc, 
             leftGain = voice.gain * cosf((1 + p) * quarterPi);
             rightGain = voice.gain * cosf((1 - p) * quarterPi);
         }
-        left = fmaf(sample.x, level * leftGain, left);
-        right = fmaf(sample.y, level * rightGain, right);
+        if (voice.stereoMatrix) {
+            const auto l = sample.x * leftGain;
+            const auto r = sample.y * rightGain;
+            left = fmaf(fmaf(r, voice.widthCross, l * voice.widthDirect), level * voice.positionLeft, left);
+            right = fmaf(fmaf(l, voice.widthCross, r * voice.widthDirect), level * voice.positionRight, right);
+        } else {
+            left = fmaf(sample.x, level * leftGain, left);
+            right = fmaf(sample.y, level * rightGain, right);
+        }
     }
     const auto amplitude = volume * expression;
     output[tile.output + lane] = make_short2(pcm16(left * amplitude), pcm16(right * amplitude));

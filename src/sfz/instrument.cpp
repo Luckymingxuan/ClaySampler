@@ -52,13 +52,18 @@ float number(const std::string& value, float low, float high)
     return result;
 }
 
-int integer(const std::string& value, int low, int high)
+int64_t integer64(const std::string& value, int64_t low, int64_t high)
 {
     size_t length = 0;
     auto result = std::stoll(value, &length);
     if (length != value.size() || result < low || result > high)
         throw std::runtime_error("invalid value " + value);
-    return static_cast<int>(result);
+    return result;
+}
+
+int integer(const std::string& value, int low, int high)
+{
+    return static_cast<int>(integer64(value, low, high));
 }
 
 int key(const std::string& value)
@@ -84,6 +89,13 @@ bool enabled(const std::string& value)
     if (value == "off" || value == "0")
         return false;
     throw std::runtime_error("invalid switch " + value);
+}
+
+bool powerCurve(const std::string& value)
+{
+    if (value == "power") return true;
+    if (value == "gain") return false;
+    throw std::runtime_error("unsupported crossfade curve " + value);
 }
 
 class Loader {
@@ -226,9 +238,18 @@ private:
         else if (current_ == "control") {
             if (name == "default_path") {
                 defaultPath_ = filePath(value);
-            } else if (name.compare(0, 5, "set_cc") == 0) {
-                const auto cc = integer(name.substr(5), 0, 127);
-                instrument_.initialCC[cc] = static_cast<uint8_t>(integer(value, 0, 127));
+            } else if (name.compare(0, 6, "set_cc") == 0) {
+                const auto cc = integer(name.substr(6), 0, 127);
+                instrument_.initialCC[cc] = number(value, 0, 127);
+            } else if (name.compare(0, 8, "set_hdcc") == 0) {
+                const auto cc = integer(name.substr(8), 0, 127);
+                instrument_.initialCC[cc] = 127 * number(value, 0, 1);
+            } else if (name.compare(0, 8, "label_cc") == 0) {
+                (void)integer(name.substr(8), 0, 511);
+            } else if (name.compare(0, 9, "label_key") == 0) {
+                (void)integer(name.substr(9), 0, 127);
+            } else if (name == "image" || name == "image_controls") {
+                return; // Display metadata has no offline render behavior.
             } else {
                 throw std::runtime_error("unsupported control opcode " + name);
             }
@@ -243,14 +264,17 @@ private:
             return;
         Region region;
         std::string sample;
-        std::map<int, Condition> conditions;
+        std::map<int, Condition> conditions, triggers;
         for (const auto* scope : {&global_, &master_, &group_, &region_}) {
             // key sets all three key fields. Specific fields in the same scope win.
-            if (auto it = scope->find("key"); it != scope->end())
-                region.lowKey = region.highKey = region.rootKey = key(it->second);
+            if (auto it = scope->find("key"); it != scope->end()) {
+                region.triggerOnNote = it->second != "-1";
+                region.lowKey = region.highKey = region.rootKey =
+                    region.triggerOnNote ? key(it->second) : 60;
+            }
             for (const auto& item : *scope) {
                 try {
-                    apply(region, sample, conditions, item.first, item.second);
+                    apply(region, sample, conditions, triggers, item.first, item.second);
                 } catch (const std::exception& error) {
                     throw std::runtime_error(item.first + "=" + item.second + ": " + error.what());
                 }
@@ -259,9 +283,17 @@ private:
         region_.clear();
         if (sample.empty() || sample.front() == '*')
             throw std::runtime_error("missing or unsupported region sample " + sample);
-        if (region.lowKey > region.highKey || region.lowVelocity > region.highVelocity ||
-            region.sequencePosition > region.sequenceLength || region.randomLow >= region.randomHigh)
+        if ((region.lowKey > region.highKey && triggers.empty()) || region.lowVelocity > region.highVelocity ||
+            region.sequencePosition > region.sequenceLength || region.randomLow >= region.randomHigh ||
+            region.switchLow > region.switchHigh)
             throw std::runtime_error("invalid region range for " + sample);
+        if (!region.velocityCurve.empty()) {
+            std::sort(region.velocityCurve.begin(), region.velocityCurve.end());
+            if (region.velocityCurve.front().first != 0)
+                region.velocityCurve.insert(region.velocityCurve.begin(), {0, 0});
+            if (region.velocityCurve.back().first != 127)
+                region.velocityCurve.emplace_back(127, 1);
+        }
         region.sample = bank_.describe(root_ / defaultPath_ / filePath(sample));
         const Sample& audio = bank_.samples[region.sample];
         region.end = region.end < 0 ? audio.frames : std::min(region.end + 1, audio.frames);
@@ -285,36 +317,98 @@ private:
         if (region.sustainEnabled)
             instrument_.usedCC[region.sustainCC] = true;
         auto index = static_cast<int>(instrument_.regions.size());
-        for (int note = region.lowKey; note <= region.highKey; ++note)
-            instrument_.byKey[note].push_back(index);
+        if (region.triggerOnNote) {
+            for (int note = region.lowKey; note <= region.highKey; ++note)
+                instrument_.byKey[note].push_back(index);
+        }
+        for (const auto& item : triggers) {
+            if (item.second.low > item.second.high)
+                throw std::runtime_error("invalid CC trigger range for " + sample);
+            region.ccTriggers.push_back(item.second);
+            instrument_.byCC[item.first].push_back(index);
+            instrument_.usedCC[item.first] = true;
+        }
+        if (region.switchLow >= 0) {
+            for (int note = region.switchLow; note <= region.switchHigh; ++note)
+                instrument_.switchKeys[note] = true;
+        }
+        if (region.switchDefault >= 0)
+            instrument_.initialSwitch = region.switchDefault;
+        instrument_.hasOffBy |= region.chokedByGroup;
         instrument_.regions.push_back(std::move(region));
     }
 
     static void apply(Region& r, std::string& sample, std::map<int, Condition>& conditions,
+                      std::map<int, Condition>& triggers,
                       const std::string& op, const std::string& v)
     {
         if (op == "sample") sample = v;
         else if (op == "key" || op == "group_label" || op == "master_label" ||
-                 op == "global_label" || op == "region_label") return;
-        else if (op == "lokey") r.lowKey = key(v);
-        else if (op == "hikey") r.highKey = key(v);
+                 op == "global_label" || op == "region_label" || op == "sw_label") return;
+        else if (op == "lokey") r.lowKey = v == "-1" ? 0 : key(v);
+        else if (op == "hikey") {
+            r.triggerOnNote = v != "-1";
+            r.highKey = r.triggerOnNote ? key(v) : 127;
+        }
         else if (op == "pitch_keycenter") r.rootKey = key(v);
         else if (op == "lovel") r.lowVelocity = integer(v, 0, 127);
         else if (op == "hivel") r.highVelocity = integer(v, 0, 127);
+        else if (op == "lochan" || op == "hichan") { (void)integer(v, 1, 16); } // sfizz ignores these.
         else if (op == "volume") r.volume += number(v, -144, 60);
         else if (op == "amplitude") r.amplitude *= number(v, 0, 10000) / 100;
         else if (op == "amp_veltrack") r.velocityTrack = number(v, -100, 100) / 100;
+        else if (op == "amp_random") r.ampRandom = number(v, -24, 24);
+        else if (op == "pitch_random") r.pitchRandom = number(v, -12000, 12000);
+        else if (op.compare(0, 13, "amp_velcurve_") == 0) {
+            const auto velocity = integer(op.substr(13), 0, 127);
+            const auto value = number(v, 0, 1);
+            const auto point = std::find_if(r.velocityCurve.begin(), r.velocityCurve.end(),
+                [&](const auto& p) { return p.first == velocity; });
+            if (point == r.velocityCurve.end()) r.velocityCurve.emplace_back(velocity, value);
+            else point->second = value;
+        }
         else if (op == "pan") r.pan = number(v, -100, 100) / 100;
-        else if (op == "tune") r.tune += number(v, -1200, 1200);
-        else if (op == "transpose") r.tune += 100 * integer(v, -127, 127);
+        else if (op == "width") r.width = number(v, -100, 100) / 100;
+        else if (op == "position") r.position = number(v, -100, 100) / 100;
+        else if (op == "xfin_lokey") r.keyFade.inLow = key(v);
+        else if (op == "xfin_hikey") r.keyFade.inHigh = key(v);
+        else if (op == "xfout_lokey") r.keyFade.outLow = key(v);
+        else if (op == "xfout_hikey") r.keyFade.outHigh = key(v);
+        else if (op == "xfin_lovel") r.velocityFade.inLow = integer(v, 0, 127);
+        else if (op == "xfin_hivel") r.velocityFade.inHigh = integer(v, 0, 127);
+        else if (op == "xfout_lovel") r.velocityFade.outLow = integer(v, 0, 127);
+        else if (op == "xfout_hivel") r.velocityFade.outHigh = integer(v, 0, 127);
+        else if (op == "xf_keycurve") r.keyFade.power = powerCurve(v);
+        else if (op == "xf_velcurve") r.velocityFade.power = powerCurve(v);
+        else if (op == "tune" || op == "pitch") r.tune = number(v, -1200, 1200);
+        else if (op == "transpose") r.transpose = integer(v, -127, 127);
         else if (op == "pitch_keytrack") r.keyTrack = number(v, -1200, 1200);
-        else if (op == "bend_up") r.bendUp = number(v, 0, 9600);
-        else if (op == "bend_down") r.bendDown = number(v, -9600, 0);
+        else if (op == "bend_up" || op == "bendup") r.bendUp = number(v, -12000, 12000);
+        else if (op == "bend_down" || op == "benddown") r.bendDown = number(v, -12000, 12000);
         else if (op == "delay") r.delay = number(v, 0, 100);
+        else if (op == "group") r.group = integer64(v, -INT32_MAX, UINT32_MAX);
+        else if (op == "off_by" || op == "offby") {
+            r.offBy = integer64(v, -INT32_MAX, UINT32_MAX);
+            r.chokedByGroup = true;
+        } else if (op == "off_mode" || op == "offmode") {
+            if (v == "fast") r.offMode = OffMode::fast;
+            else if (v == "normal") r.offMode = OffMode::normal;
+            else if (v == "time") r.offMode = OffMode::time;
+            else throw std::runtime_error("unsupported off mode " + v);
+        } else if (op == "off_time") {
+            r.offTime = number(v, 0, 100);
+            r.offMode = OffMode::time;
+        }
         else if (op == "offset") r.offset = integer(v, 0, INT32_MAX - 1);
         else if (op == "end") r.end = integer(v, 0, INT32_MAX - 1);
-        else if (op == "loop_start") r.loopStart = integer(v, 0, INT32_MAX - 1);
-        else if (op == "loop_end") r.loopEnd = integer(v, 0, INT32_MAX - 1);
+        else if (op == "loop_start" || op == "loopstart") r.loopStart = integer(v, 0, INT32_MAX - 1);
+        else if (op == "loop_end" || op == "loopend") r.loopEnd = integer(v, 0, INT32_MAX - 1);
+        else if (op == "loop_crossfade") r.loopCrossfade = std::max(.001f, number(v, 0, 100));
+        else if (op == "loop_type" || op == "looptype") {
+            if (v != "forward" && v != "alternate" && v != "backward")
+                throw std::runtime_error("unknown loop direction hint " + v);
+            // These hints have no effect in sfizz 1.2.3.
+        }
         else if (op == "ampeg_delay") r.envelopeDelay = number(v, 0, 100);
         else if (op == "ampeg_attack") r.attack = number(v, 0, 100);
         else if (op == "ampeg_hold") r.hold = number(v, 0, 100);
@@ -330,6 +424,16 @@ private:
         else if (op == "sustain_lo") r.sustainLow = integer(v, 0, 127);
         else if (op == "seq_length") r.sequenceLength = integer(v, 1, 1000000);
         else if (op == "seq_position") r.sequencePosition = integer(v, 1, 1000000);
+        else if (op == "sw_default") r.switchDefault = key(v);
+        else if (op == "sw_lokey" || op == "sw_hikey") { (void)key(v); } // Switch display range.
+        else if (op == "sw_last") {
+            if (!r.switchRange) r.switchLow = r.switchHigh = key(v);
+        } else if (op == "sw_lolast" || op == "sw_hilast") {
+            auto note = key(v);
+            if (!r.switchRange) r.switchLow = r.switchHigh = note;
+            (op == "sw_lolast" ? r.switchLow : r.switchHigh) = note;
+            r.switchRange = true;
+        }
         else if (op == "lorand") r.randomLow = number(v, 0, 1);
         else if (op == "hirand") r.randomHigh = number(v, 0, 1);
         else if (op == "trigger") {
@@ -340,12 +444,15 @@ private:
             const std::map<std::string, Loop> values{{"no_loop", Loop::none}, {"one_shot", Loop::oneShot},
                 {"loop_continuous", Loop::continuous}, {"loop_sustain", Loop::sustain}};
             r.loop = values.at(v);
-        } else if (op.compare(0, 4, "locc") == 0 || op.compare(0, 4, "hicc") == 0) {
-            auto cc = static_cast<uint8_t>(integer(op.substr(4), 0, 127));
-            auto& condition = conditions.emplace(cc, Condition{cc, 0, 127}).first->second;
-            (op[0] == 'l' ? condition.low : condition.high) = static_cast<uint8_t>(integer(v, 0, 127));
         } else {
-            throw std::runtime_error("unsupported SFZ opcode");
+            const bool trigger = op.compare(0, 3, "on_") == 0;
+            const auto offset = trigger ? 3 : 0;
+            if (op.compare(offset, 4, "locc") != 0 && op.compare(offset, 4, "hicc") != 0)
+                throw std::runtime_error("unsupported SFZ opcode");
+            auto cc = static_cast<uint8_t>(integer(op.substr(offset + 4), 0, 127));
+            auto& ranges = trigger ? triggers : conditions;
+            auto& condition = ranges.emplace(cc, Condition{cc, 0, 127}).first->second;
+            (op[offset] == 'l' ? condition.low : condition.high) = static_cast<uint8_t>(integer(v, 0, 127));
         }
     }
 

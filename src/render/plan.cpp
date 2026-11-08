@@ -14,6 +14,8 @@ constexpr float silence = 1e-4f;
 constexpr int referenceBlock = 1024;
 constexpr float masterGainDb = -7.35f;
 
+enum class VoiceKind { attack, release, controller };
+
 struct Voice {
     VoiceSpan span;
     int key;
@@ -21,7 +23,8 @@ struct Voice {
     const Region* region;
     double baseStep;
     bool noteOff = false;
-    bool releaseSample;
+    VoiceKind kind;
+    bool choked = false;
 };
 
 struct Release {
@@ -32,6 +35,40 @@ struct Release {
 struct Bend {
     int begin = 0, end = 0, from = 0, to = 0;
 };
+
+float velocityGain(const Region& r, int velocity)
+{
+    auto normalized = float(velocity) / 127;
+    auto gain = normalized * normalized;
+    if (!r.velocityCurve.empty()) {
+        const auto last = std::lower_bound(r.velocityCurve.begin(), r.velocityCurve.end(), velocity,
+            [](const auto& point, int value) { return point.first < value; });
+        if (last->first == velocity) {
+            gain = last->second;
+        } else {
+            const auto first = std::prev(last);
+            const auto phase = float(velocity - first->first) / (last->first - first->first);
+            gain = first->second + phase * (last->second - first->second);
+        }
+    }
+    const auto track = std::abs(r.velocityTrack) * (1 - gain);
+    return r.velocityTrack < 0 ? track : 1 - track;
+}
+
+float crossfadeGain(const Crossfade& fade, int value, bool velocity)
+{
+    const auto end = [velocity](int high) { return velocity && high == 127 ? 126 : high; };
+    const auto inHigh = end(fade.inHigh);
+    const auto outHigh = end(fade.outHigh);
+    float up = 1, down = 1;
+    if (value < fade.inLow)
+        up = 0;
+    else if (inHigh > fade.inLow)
+        up = std::min(1.f, float(value - fade.inLow) / (inHigh - fade.inLow));
+    if (outHigh > fade.outLow)
+        down = std::clamp(float(outHigh - value) / (outHigh - fade.outLow), 0.f, 1.f);
+    return fade.power ? std::sqrt(up * down) : up * down;
+}
 
 std::vector<Bend> bendTimeline(const Midi& midi)
 {
@@ -128,8 +165,13 @@ std::vector<ControlPoint> automation(const Midi& midi, int cc, float initial, bo
     return points;
 }
 
-float heldLevel(const VoiceSpan& voice, int frame)
+float envelopeLevel(const VoiceSpan& voice, int frame)
 {
+    if (voice.releaseStart >= 0 && frame >= voice.releaseStart) {
+        if (frame >= voice.fadeStart)
+            return std::max(0.f, voice.fadeValue - (frame - voice.fadeStart + 1) * voice.fadeStep);
+        return voice.releaseValue * std::exp((frame - voice.releaseStart + 1) * voice.releaseRate);
+    }
     if (frame < voice.attackStart)
         return voice.start;
     if (frame < voice.holdStart)
@@ -176,7 +218,8 @@ class Planner {
 public:
     Planner(const Instrument& instrument, AudioBank& bank, int rate, unsigned seed)
         : instrument_(instrument), bank_(bank), rate_(rate), cc_(instrument.initialCC),
-          sequence_(instrument.regions.size()), random_(seed)
+          sequence_(instrument.regions.size()), random_(seed), variation_(seed ^ 0x85ebca6b),
+          currentSwitch_(instrument.initialSwitch)
     {
     }
 
@@ -198,7 +241,7 @@ public:
         prune(midi.end);
         // Match the offline convention of releasing any still-held voices at EOF.
         for (auto& voice : active_) {
-            if (!voice.releaseSample && voice.region->loop != Loop::oneShot)
+            if (voice.kind == VoiceKind::attack && voice.region->loop != Loop::oneShot)
                 release(voice, midi.end);
             if (voice.span.end == forever)
                 throw std::runtime_error("a looping one-shot or release sample has no finite end");
@@ -252,9 +295,15 @@ private:
     {
         return velocity >= r.lowVelocity && velocity <= r.highVelocity &&
             draw >= r.randomLow && draw < r.randomHigh &&
-            std::all_of(r.conditions.begin(), r.conditions.end(), [&](const Condition& c) {
-                return cc_[c.cc] >= c.low && cc_[c.cc] <= c.high;
-            });
+            (r.switchLow < 0 || (currentSwitch_ >= r.switchLow && currentSwitch_ <= r.switchHigh)) &&
+            controllersMatch(r);
+    }
+
+    bool controllersMatch(const Region& region) const
+    {
+        return std::all_of(region.conditions.begin(), region.conditions.end(), [&](const Condition& c) {
+            return cc_[c.cc] >= c.low && cc_[c.cc] <= c.high;
+        });
     }
 
     void applyBend(Voice& voice) const
@@ -295,16 +344,22 @@ private:
         return span.releaseStart < 0 ? forever : span.fadeStart + rate_ / 20 + 1;
     }
 
-    void trigger(const Region& r, int frame, int key, int velocity, bool releaseSample, int duration = 0)
+    void trigger(const Region& r, int frame, int key, int velocity, VoiceKind kind, int duration = 0,
+                 int controller = -1)
     {
+        if (instrument_.hasOffBy)
+            choke(r, frame, controller >= 0 ? controller : key, kind);
         const auto& sample = bank_.decode(r.sample);
+        const auto vary = [&](float extent) {
+            return extent == 0 ? 0.f : extent * std::generate_canonical<float, 24>(variation_);
+        };
         Voice voice{};
         voice.key = key;
         voice.velocity = velocity;
         voice.region = &r;
-        voice.releaseSample = releaseSample;
+        voice.kind = kind;
         voice.baseStep = (double(sample.rate) / rate_) * std::exp2(
-            (r.keyTrack * (key - r.rootKey) + r.tune) / 1200.0);
+            (r.keyTrack * (key - r.rootKey) + r.tune + 100 * r.transpose + vary(r.pitchRandom)) / 1200.0);
         auto& span = voice.span;
         span.sample = sample.offset;
         span.channels = sample.channels;
@@ -315,6 +370,8 @@ private:
         if (r.loop == Loop::continuous || r.loop == Loop::sustain) {
             span.loopFirst = r.loopStart;
             span.loopEnd = r.loopEnd;
+            span.loopCrossfade = static_cast<int>(std::lround(
+                std::min<double>(r.loopStart, double(r.loopCrossfade) * sample.rate)));
         }
         span.start = r.start;
         span.attackStart = span.begin + int(r.envelopeDelay * rate_);
@@ -325,35 +382,55 @@ private:
         span.decayRate = r.decay > 0 ? -9 / (std::max(.006f, r.decay) * rate_) : 0;
         span.sustain = r.sustain;
         span.releaseStart = -1;
-        auto vel = float(velocity) / 127;
-        float track = std::abs(r.velocityTrack) * (1 - vel * vel);
-        const auto gain = r.amplitude * (r.velocityTrack < 0 ? track : 1 - track) *
-            std::pow(10.f, (masterGainDb + r.volume - r.releaseDecay * duration / rate_ + 3) / 20);
+        const auto noteGain = kind == VoiceKind::controller ? 1.f : velocityGain(r, velocity) *
+            crossfadeGain(r.keyFade, key, false) * crossfadeGain(r.velocityFade, velocity, true);
+        const auto gain = r.amplitude * noteGain *
+            std::pow(10.f, (masterGainDb + r.volume + vary(r.ampRandom) - r.releaseDecay * duration / rate_ + 3) / 20);
         constexpr float quarterPi = .7853981633974483f;
+        constexpr float panCompensation = 1.4125375446227544f;
+        const bool stereoMatrix = sample.channels == 2 && (r.width != 1 || r.position != 0);
+        span.stereoMatrix = stereoMatrix;
         const auto positionGain = sample.channels == 1 ? 1.f : .99881488f;
-        span.gain = gain * positionGain;
+        span.gain = gain * (stereoMatrix ? panCompensation : positionGain);
         span.pan = r.pan;
         span.left = span.gain * std::cos((1 + r.pan) * quarterPi);
         span.right = span.gain * std::cos((1 - r.pan) * quarterPi);
+        span.widthDirect = stereoMatrix ? std::cos((1 - r.width) * quarterPi) : 1.f;
+        span.widthCross = stereoMatrix ? std::cos((1 + r.width) * quarterPi) : 0.f;
+        span.positionLeft = stereoMatrix ? std::cos((1 + r.position) * quarterPi) : 1.f;
+        span.positionRight = stereoMatrix ? std::cos((1 - r.position) * quarterPi) : 1.f;
         span.end = voiceEnd(span, forever);
         active_.push_back(voice);
     }
 
     void release(Voice& voice, int frame)
     {
-        auto& span = voice.span;
-        if (span.releaseStart >= 0 || voice.releaseSample || voice.region->loop == Loop::oneShot ||
-            frame >= span.end)
+        if (voice.span.releaseStart >= 0 || voice.kind != VoiceKind::attack || voice.region->loop == Loop::oneShot)
             return;
-        frame = std::max(frame, span.begin);
-        if (voice.region->loop == Loop::sustain && span.loopEnd > 0) {
-            split(voice, frame, wrap(span, span.position + travel(span, frame - span.begin)));
+        startRelease(voice, frame, voice.region->release);
+    }
+
+    void startRelease(Voice& voice, int frame, float seconds)
+    {
+        auto& span = voice.span;
+        if (frame >= span.end)
+            return;
+        if (frame < span.begin) {
+            span.end = span.begin;
+            return;
+        }
+        const auto level = envelopeLevel(span, frame - 1);
+        const bool exitLoop = voice.region->loop == Loop::sustain && span.loopEnd > 0;
+        if (exitLoop || span.releaseStart >= 0) {
+            auto phase = span.position + travel(span, frame - span.begin);
+            split(voice, frame, exitLoop ? wrap(span, phase) : phase);
             applyBend(voice);
-            span.loopEnd = 0;
+            if (exitLoop)
+                span.loopEnd = 0;
         }
         span.releaseStart = frame;
-        span.releaseValue = heldLevel(span, frame - 1);
-        span.releaseRate = -9 / (std::max(.006f, voice.region->release) * rate_);
+        span.releaseValue = level;
+        span.releaseRate = -9 / (std::max(.006f, seconds) * rate_);
         auto exponentialFrames = span.releaseValue > silence
             ? static_cast<int>(std::log(silence / span.releaseValue) / span.releaseRate) : 0;
         span.fadeStart = frame + exponentialFrames;
@@ -362,9 +439,32 @@ private:
         span.end = voiceEnd(span, fadeEnd(span));
     }
 
+    void choke(const Region& incoming, int frame, int key, VoiceKind cause)
+    {
+        std::vector<std::pair<int, int>> released;
+        for (auto& voice : active_) {
+            const auto& r = *voice.region;
+            if (voice.span.end <= frame || voice.kind == VoiceKind::release || voice.choked || !r.chokedByGroup ||
+                r.offBy != incoming.group ||
+                (r.group == incoming.group && voice.key == key && controllersMatch(r)))
+                continue;
+            voice.choked = true;
+            const auto time = r.offMode == OffMode::normal ? r.release :
+                r.offMode == OffMode::fast ? .006f : r.offTime;
+            startRelease(voice, frame, time);
+            if (cause != VoiceKind::controller && voice.kind == VoiceKind::attack)
+                released.emplace_back(voice.key, voice.velocity);
+        }
+        for (const auto& note : released)
+            releaseRegions(frame, note.first, note.second, std::max(0, frame - noteStart_[note.first]));
+    }
+
     void noteOn(const Event& event)
     {
-        if (!down_[event.a])
+        const bool switching = instrument_.switchKeys[event.a];
+        if (switching)
+            currentSwitch_ = event.a;
+        if (!down_[event.a] && !switching)
             ++keysDown_;
         down_[event.a] = true;
         noteVelocity_[event.a] = event.b;
@@ -378,14 +478,14 @@ private:
             if (region.trigger == Trigger::attack ||
                 (region.trigger == Trigger::first && keysDown_ == 1) ||
                 (region.trigger == Trigger::legato && keysDown_ > 1))
-                trigger(region, event.frame, event.a, event.b, false);
+                trigger(region, event.frame, event.a, event.b, VoiceKind::attack);
         }
     }
 
     bool hasAttackVoice(const Region& r) const
     {
         return std::any_of(active_.begin(), active_.end(), [&](const Voice& voice) {
-            return !voice.releaseSample && voice.key >= r.lowKey && voice.key <= r.highKey &&
+            return voice.kind == VoiceKind::attack && voice.key >= r.lowKey && voice.key <= r.highKey &&
                 voice.velocity >= r.lowVelocity && voice.velocity <= r.highVelocity;
         });
     }
@@ -395,26 +495,30 @@ private:
         if (!down_[event.a])
             return;
         down_[event.a] = false;
-        --keysDown_;
+        if (!instrument_.switchKeys[event.a])
+            --keysDown_;
         for (auto& voice : active_) {
-            if (voice.key == event.a && !voice.releaseSample) {
+            if (voice.key == event.a && voice.kind == VoiceKind::attack) {
                 voice.noteOff = true;
                 if (!pedal(*voice.region))
                     release(voice, event.frame);
             }
         }
-        const auto velocity = noteVelocity_[event.a];
-        const auto duration = event.frame - noteStart_[event.a];
+        releaseRegions(event.frame, event.a, noteVelocity_[event.a], event.frame - noteStart_[event.a]);
+    }
+
+    void releaseRegions(int frame, int key, int velocity, int duration)
+    {
         const float draw = std::generate_canonical<float, 24>(random_);
-        for (const auto index : instrument_.byKey[event.a]) {
+        for (const auto index : instrument_.byKey[key]) {
             const auto& r = instrument_.regions[index];
             if ((r.trigger != Trigger::release && r.trigger != Trigger::releaseKey) ||
                 !matches(r, velocity, draw))
                 continue;
             if (r.trigger == Trigger::release && pedal(r)) {
-                delayed_.push_back({event.a, velocity, duration, &r});
+                delayed_.push_back({key, velocity, duration, &r});
             } else if (r.trigger == Trigger::releaseKey || r.releaseDead || hasAttackVoice(r)) {
-                trigger(r, event.frame, event.a, velocity, true, duration);
+                trigger(r, frame, key, velocity, VoiceKind::release, duration);
             }
         }
     }
@@ -443,15 +547,35 @@ private:
                 previous >= r.sustainLow && !pedal(r))
                 release(voice, event.frame);
         }
+        std::vector<Release> due;
         auto end = std::remove_if(delayed_.begin(), delayed_.end(), [&](const Release& releaseNote) {
             const auto& r = *releaseNote.region;
             if (r.sustainCC != event.a || pedal(r))
                 return false;
             if (r.releaseDead || hasAttackVoice(r))
-                trigger(r, event.frame, releaseNote.key, releaseNote.velocity, true, releaseNote.duration);
+                due.push_back(releaseNote);
             return true;
         });
         delayed_.erase(end, delayed_.end());
+        for (const auto& note : due)
+            trigger(*note.region, event.frame, note.key, note.velocity, VoiceKind::release, note.duration);
+        const auto& triggers = instrument_.byCC[event.a];
+        if (triggers.empty())
+            return;
+        const auto draw = std::generate_canonical<float, 24>(random_);
+        for (auto index : triggers) {
+            const auto& region = instrument_.regions[index];
+            auto condition = std::find_if(region.ccTriggers.begin(), region.ccTriggers.end(),
+                [&](const Condition& range) { return range.cc == event.a; });
+            if (event.b < condition->low || event.b > condition->high ||
+                draw < region.randomLow || draw >= region.randomHigh)
+                continue;
+            const bool step = sequence_[index]++ % region.sequenceLength == unsigned(region.sequencePosition - 1);
+            const bool switched = region.switchLow < 0 ||
+                (currentSwitch_ >= region.switchLow && currentSwitch_ <= region.switchHigh);
+            if (step && switched && previous != event.b && controllersMatch(region))
+                trigger(region, event.frame, region.rootKey, event.b, VoiceKind::controller, 0, event.a);
+        }
     }
 
     const Instrument& instrument_;
@@ -461,10 +585,11 @@ private:
     std::array<bool, 128> down_{};
     std::array<int, 128> noteStart_{}, noteVelocity_{};
     std::vector<unsigned> sequence_;
-    std::mt19937 random_;
+    std::mt19937 random_, variation_;
     std::vector<Voice> active_;
     std::vector<Release> delayed_;
     int keysDown_ = 0;
+    int currentSwitch_;
     Bend bend_;
     RenderPlan plan_;
 };
