@@ -107,6 +107,13 @@ const Sample& AudioBank::decode(int id)
     return sample;
 }
 
+void AudioBank::releaseDecoded()
+{
+    std::vector<float>().swap(pcm);
+    for (auto& sample : samples)
+        sample.offset = UINT64_MAX;
+}
+
 void writeWave(const std::filesystem::path& path, const int16_t* pcm, int dataFrames, int frames,
                int rate, int channels)
 {

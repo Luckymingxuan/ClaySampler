@@ -14,6 +14,9 @@ struct RenderPlan {
     int frames = 0;
     int musicEnd = 0, limit = 0, fadeFrames = 0;
     bool tailClipped = false;
+    int bodyFrames = 0;
+    std::vector<int> onsets;
+    size_t volumeGroup = 0;
 };
 
 RenderPlan planRender(const Instrument& instrument, AudioBank& bank, const Midi& midi,

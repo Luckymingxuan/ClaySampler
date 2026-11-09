@@ -22,9 +22,11 @@ else()
     target_compile_options(claysampler PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/cuda/render.cu src/cuda/tail.cu src/cuda/render_types.h)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/cuda/render.cu src/cuda/tail.cu
+    src/cuda/quality.cu src/cuda/render_types.h)
 file(READ src/cuda/render.cu CLAY_CUDA_SOURCE)
 file(READ src/cuda/tail.cu CLAY_CUDA_TAIL)
+file(READ src/cuda/quality.cu CLAY_CUDA_QUALITY)
 file(READ src/cuda/render_types.h CLAY_CUDA_TYPES)
 configure_file(src/cuda/kernel_source.h.in generated/kernel_source.h @ONLY)
 target_include_directories(claysampler PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)

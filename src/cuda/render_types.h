@@ -90,13 +90,41 @@ struct TailConfig {
     double relative, floor, ceiling;
 };
 
-enum class TailStatus { ok, duration, nonfinite, peak };
+enum class TailStatus {
+    ok, duration, nonfinite, peak, audioDuration, quietPerformance, excessiveSilence,
+    silentAudio, clipping, silentBody, incompleteGroup
+};
+
+struct AudioConfig {
+    int rate, window, maxFrames, minPeak;
+    bool enabled;
+    double minMedian, minQuartile, silencePower, maxSilentFraction, maxSilentFrames, maxClippedFraction;
+};
+
+struct AudioJob {
+    int bodyFrames, bodyFirst, onsetFirst, onsetCount;
+};
+
+struct AudioMetrics {
+    double median, quartile, silentFraction, clippedFraction, bodyRms, targetRms, gain;
+    int longestSilence, clipped;
+    TailStatus verdict;
+    bool measured;
+};
+
+struct AudioGroup { int first, end; };
+
+struct PcmJob {
+    unsigned long long sourceOffset;
+    int blockFirst;
+};
 
 struct TailResult {
     unsigned long long offset;
     int frames, dataFrames, fade, peak, first, last;
     TailStatus status;
     float scale;
+    AudioMetrics audio;
 };
 
 struct StereoStats { double power; float peak; };

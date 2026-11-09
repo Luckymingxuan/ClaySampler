@@ -29,8 +29,8 @@ __device__ T tailReduce(T value, T identity, Operation operation)
     return value;
 }
 
-template<int TailJob::*First>
-__device__ int tailJobFor(const TailJob* jobs, int count, int block)
+template<auto First, class Job>
+__device__ int tailJobFor(const Job* jobs, int count, int block)
 {
     int first = 0;
     while (first + 1 < count) {
@@ -226,6 +226,9 @@ extern "C" __global__ void finalizePcm(const TailJob* jobs, int count, const sho
         return;
     constexpr int channels = CLAY_FLOAT_OUTPUT ? 1 : 2;
     int peak = 0, audibleFirst = frames, audibleLast = -1;
+#if CLAY_AUDIO_QA
+    int clipped = 0;
+#endif
     const int fadeStart = frames - fade;
     for (int frame = first + threadIdx.x; frame < end; frame += blockDim.x) {
         int framePeak = 0;
@@ -237,6 +240,9 @@ extern "C" __global__ void finalizePcm(const TailJob* jobs, int count, const sho
             if (CLAY_FLOAT_OUTPUT || frame >= fadeStart)
                 output[(outputOffset + frame) * channels + channel] = value;
             framePeak = max(framePeak, abs(int(value)));
+#if CLAY_AUDIO_QA
+            clipped += abs(int(value)) >= 32767;
+#endif
         }
         peak = max(peak, framePeak);
         if (framePeak > 3) {
@@ -247,6 +253,11 @@ extern "C" __global__ void finalizePcm(const TailJob* jobs, int count, const sho
     peak = tailReduce(peak, 0, Maximum{});
     audibleFirst = tailReduce(audibleFirst, frames, Minimum{});
     audibleLast = tailReduce(audibleLast, -1, Maximum{});
+#if CLAY_AUDIO_QA
+    clipped = tailReduce(clipped, 0, Sum{});
+    if (!threadIdx.x && clipped)
+        atomicAdd(&results[index].audio.clipped, clipped);
+#endif
     if (!threadIdx.x && audibleLast >= 0) {
         atomicMax(&results[index].peak, peak);
         atomicMin(&results[index].first, audibleFirst);

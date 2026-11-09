@@ -23,6 +23,7 @@ public:
     AudioBank& operator=(const AudioBank&) = delete;
     int describe(const std::filesystem::path& path);
     const Sample& decode(int id);
+    void releaseDecoded();
 
     std::vector<Sample> samples;
     std::vector<float> pcm;

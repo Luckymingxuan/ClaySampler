@@ -161,7 +161,7 @@ struct ArenaLayout {
 
 size_t blocksFor(size_t frames, size_t block) { return (frames + block - 1) / block; }
 
-std::vector<char> compile(const Path& library, int architecture, bool floatingPoint)
+std::vector<char> compile(const Path& library, int architecture, bool floatingPoint, bool quality, bool grouping)
 {
     Library rtc(library);
     const auto version = rtc.get<int(*)(int*, int*)>("nvrtcVersion");
@@ -214,8 +214,9 @@ std::vector<char> compile(const Path& library, int architecture, bool floatingPo
     const bool parallel = hasVersion && (major > 12 || (major == 12 && minor >= 4)) &&
         std::thread::hardware_concurrency() >= 4;
     const char* flags[] = {archFlag.c_str(), "--std=c++17", floatingPoint ? "-DCLAY_FLOAT_OUTPUT=1" : "-DCLAY_FLOAT_OUTPUT=0",
-        "--split-compile=4"};
-    if (run(program, parallel ? 4 : 3, flags)) {
+        quality ? "-DCLAY_AUDIO_QA=1" : "-DCLAY_AUDIO_QA=0",
+        grouping ? "-DCLAY_GROUP_VOLUME=1" : "-DCLAY_GROUP_VOLUME=0", "--split-compile=4"};
+    if (run(program, parallel ? 6 : 5, flags)) {
         size_t bytes{};
         check(logSize(program, &bytes));
         std::vector<char> diagnostics(bytes);
@@ -350,20 +351,25 @@ struct Renderer::Impl {
         Handle address{};
         ~Context() { if (address) driver.destroy(address); }
     } context{driver};
-    Buffer samples{driver}, sinc{driver}, arena{driver};
+    Buffer samples{driver}, sinc{driver}, arena{driver}, groupControl{driver};
     std::vector<std::shared_ptr<HostPcm>> hostPcm;
     Handle module{}, kernel{}, filterSource{}, filterPass{}, pitchPass{};
     Handle stereoScan{}, nativeEnd{}, monoQuantize{}, trimEnd{}, pcmLayout{}, pcmFinalize{};
+    Handle bodyMeasure{}, onsetMeasure{}, audioSummary{}, volumeMatch{}, acceptedLayout{}, acceptedPack{};
     std::string deviceName;
     int threads{};
     bool natural;
     TailConfig tail;
-    size_t uploaded{}, peak{};
+    AudioConfig audio;
+    int groupMinimum;
+    size_t waitingLimit;
+    size_t uploaded{}, cacheBudget{}, peak{}, waiting{}, peakWaiting{}, spilled{}, downloaded{};
 
-    Impl(int ordinal, const Path& rtc, bool useNatural, int rate)
-        : natural(useNatural), tail{int(std::nearbyint(rate / 20.)), 2 * rate,
-            int(std::nearbyint(rate / 4.)), int(std::nearbyint(rate / 10.)), std::pow(10., -1.5),
-            32768 * std::pow(10., -3.9), 32768 * std::pow(10., -3.)}
+    Impl(int ordinal, const Path& rtc, bool useNatural, AudioConfig config, int minimum, size_t limit)
+        : natural(useNatural), tail{config.window, 2 * config.rate,
+            int(std::nearbyint(config.rate / 4.)), int(std::nearbyint(config.rate / 10.)), std::pow(10., -1.5),
+            32768 * std::pow(10., -3.9), 32768 * std::pow(10., -3.)},
+          audio(config), groupMinimum(minimum), waitingLimit(limit)
     {
         driver.check(driver.init(0), "CUDA initialization");
         int device{};
@@ -375,7 +381,7 @@ struct Renderer::Impl {
         driver.check(driver.attribute(&major, 75, device), "CUDA architecture major");
         driver.check(driver.attribute(&minor, 76, device), "CUDA architecture minor");
         driver.check(driver.create(&context.address, 0, device), "CUDA context");
-        auto code = compile(rtc, 10 * major + minor, natural);
+        auto code = compile(rtc, 10 * major + minor, natural, audio.enabled, groupMinimum > 0);
         driver.check(driver.load(&module, code.data()), "CUDA module");
         driver.check(driver.kernel(&kernel, module, "renderTiles"), "CUDA render kernel");
         driver.check(driver.kernel(&filterSource, module, "renderFilterSources"), "CUDA filter source kernel");
@@ -383,6 +389,16 @@ struct Renderer::Impl {
         driver.check(driver.kernel(&pitchPass, module, "prepareVoicePitch"), "CUDA variable pitch kernel");
         driver.check(driver.kernel(&pcmLayout, module, "layoutPcm"), "CUDA PCM layout kernel");
         driver.check(driver.kernel(&pcmFinalize, module, "finalizePcm"), "CUDA PCM finalization kernel");
+        if (audio.enabled || groupMinimum) {
+            driver.check(driver.kernel(&bodyMeasure, module, "measureBody"), "CUDA body RMS kernel");
+            driver.check(driver.kernel(&audioSummary, module, "summarizeAudio"), "CUDA audio statistics kernel");
+            driver.check(driver.kernel(&acceptedLayout, module, "layoutAccepted"), "CUDA accepted PCM layout kernel");
+            driver.check(driver.kernel(&acceptedPack, module, "packAccepted"), "CUDA accepted PCM packing kernel");
+        }
+        if (audio.enabled)
+            driver.check(driver.kernel(&onsetMeasure, module, "measureOnsets"), "CUDA onset RMS kernel");
+        if (groupMinimum)
+            driver.check(driver.kernel(&volumeMatch, module, "matchVolume"), "CUDA group volume kernel");
         if (natural) {
             driver.check(driver.kernel(&stereoScan, module, "scanStereo"), "CUDA stereo statistics kernel");
             driver.check(driver.kernel(&nativeEnd, module, "selectNative"), "CUDA natural endpoint kernel");
@@ -394,10 +410,22 @@ struct Renderer::Impl {
         auto table = sincTable();
         sinc.upload(table);
         peak = sinc.capacity;
+        size_t free{}, total{};
+        driver.check(driver.memory(&free, &total), "CUDA sample cache budget");
+        cacheBudget = std::min(free - free / 3, total / 2);
     }
 
-    void uploadSamples(const AudioBank& bank)
+    void recordPeak(size_t extra = 0)
     {
+        peak = std::max(peak, sinc.capacity + samples.capacity + arena.capacity + groupControl.capacity + waiting + extra);
+    }
+
+    void uploadSamples(const AudioBank& bank, bool fresh)
+    {
+        if (fresh) {
+            samples.reset();
+            uploaded = 0;
+        }
         const auto bytes = bank.pcm.size() * sizeof(float);
         if (bytes <= uploaded && samples.address)
             return;
@@ -411,7 +439,7 @@ struct Renderer::Impl {
             if (capacity <= free && !driver.allocate(&candidate, capacity)) {
                 replacement.address = candidate;
                 replacement.capacity = capacity;
-                peak = std::max(peak, sinc.capacity + arena.capacity + samples.capacity + replacement.capacity);
+                recordPeak(replacement.capacity);
                 if (uploaded)
                     driver.check(driver.copy(replacement.address, samples.address, uploaded), "CUDA sample bank growth");
                 std::swap(samples.address, replacement.address);
@@ -426,7 +454,7 @@ struct Renderer::Impl {
             driver.check(driver.put(samples.address + uploaded, bank.pcm.data() + uploaded / sizeof(float),
                 bytes - uploaded), "CUDA sample upload");
         uploaded = bytes;
-        peak = std::max(peak, sinc.capacity + samples.capacity + arena.capacity);
+        recordPeak();
     }
 
     std::shared_ptr<int16_t> receivePcm(DevicePtr source, size_t samplesCount)
@@ -460,7 +488,53 @@ struct Renderer::Impl {
         }
     }
 
-    RenderBatch render(const std::vector<RenderPlan>& plans, size_t first)
+    struct Synthesis {
+        std::vector<TailJob> jobs;
+        DevicePtr jobData{}, resultData{}, source{}, output{}, pcmJobs{};
+        int blocks{};
+    };
+
+    int channels() const { return natural ? 1 : 2; }
+
+    int bodyWindows(int frames) const
+    {
+        const int chunk = 2 * audio.rate, span = 5 * audio.window;
+        return (frames / chunk) * int(blocksFor(chunk, span)) + int(blocksFor(frames % chunk, span));
+    }
+
+    size_t footprint(const RenderPlan& plan) const
+    {
+        const auto frameBytes = 2 * (natural ? sizeof(float) : sizeof(int16_t));
+        const auto tiles = blocksFor(plan.frames, threads);
+        size_t bytes = size_t(plan.frames) * frameBytes + tiles * sizeof(Tile) + plan.spans.size() * sizeof(VoiceSpan);
+        bytes += sizeof(TailJob) + sizeof(TailResult) + 256;
+        if (natural)
+            bytes += size_t(plan.frames) * sizeof(int16_t) + blocksFor(plan.frames, tailBlockFrames) * sizeof(StereoStats) +
+                blocksFor(plan.frames, tail.window) * sizeof(MonoStats);
+        if (audio.enabled || groupMinimum) {
+            const int body = audio.enabled || plan.volumeGroup ? plan.bodyFrames : 0;
+            bytes += sizeof(AudioJob) + sizeof(PcmJob) + size_t(bodyWindows(body)) * sizeof(unsigned long long);
+            bytes += plan.onsets.size() * (sizeof(int) + sizeof(unsigned long long));
+            if (!natural)
+                bytes += size_t(plan.frames) * frameBytes;
+        }
+        for (const auto& span : plan.spans) {
+            bytes += size_t((span.end - 1) / threads - span.begin / threads + 1) * sizeof(int);
+            if (span.filterTrack >= 0) {
+                const size_t duration = span.end - span.begin;
+                bytes += duration * 2 * sizeof(float) + blocksFor(duration, threads) * sizeof(FilterTile);
+                if (span.variablePitch)
+                    bytes += duration * sizeof(double);
+            }
+        }
+        bytes += plan.filterTracks * sizeof(int);
+        for (const auto& track : plan.controls)
+            bytes += track.size() * sizeof(ControlPoint);
+        return bytes + plan.modulation.size() * sizeof(VoiceModulation);
+    }
+
+    Synthesis synthesize(const std::vector<RenderPlan>& plans, size_t first, size_t stop, const TimingEvent& begin,
+                         const std::vector<size_t>& sizes = {})
     {
         const auto frameBytes = 2 * (natural ? sizeof(float) : sizeof(int16_t));
         size_t free{}, total{};
@@ -471,35 +545,40 @@ struct Renderer::Impl {
         const auto singleJobBudget = std::min(available - available / 3, budget + budget / 3);
         size_t estimated = 0;
         BatchIndex index;
-        std::vector<TailJob> jobs;
-        int blocks = 0, windows = 0;
-        for (size_t job = first; job < plans.size(); ++job) {
+        Synthesis synthesis;
+        auto& jobs = synthesis.jobs;
+        const bool assess = audio.enabled || groupMinimum;
+        std::vector<AudioJob> audioJobs;
+        std::vector<int> onsets;
+        int blocks = 0, windows = 0, bodyBlocks = 0;
+        for (size_t job = first; job < stop && jobs.size() < 64; ++job) {
             const auto& plan = plans[job];
-            const auto tiles = blocksFor(plan.frames, threads);
-            const auto jobBlocks = int(blocksFor(plan.frames, tailBlockFrames));
-            const auto jobWindows = natural ? int(blocksFor(plan.frames, tail.window)) : 0;
-            size_t bytes = size_t(plan.frames) * frameBytes + tiles * sizeof(Tile) + plan.spans.size() * sizeof(VoiceSpan);
-            bytes += sizeof(TailJob) + sizeof(TailResult) + 256;
-            if (natural)
-                bytes += size_t(plan.frames) * sizeof(int16_t) + jobBlocks * sizeof(StereoStats) +
-                    jobWindows * sizeof(MonoStats);
-            for (const auto& span : plan.spans) {
-                bytes += size_t((span.end - 1) / threads - span.begin / threads + 1) * sizeof(int);
-                if (span.filterTrack >= 0) {
-                    const size_t duration = span.end - span.begin;
-                    bytes += duration * 2 * sizeof(float) + ((duration + threads - 1) / threads) * sizeof(FilterTile);
-                    if (span.variablePitch)
-                        bytes += duration * sizeof(double);
-                }
-            }
-            bytes += plan.filterTracks * sizeof(int);
-            for (const auto& track : plan.controls)
-                bytes += track.size() * sizeof(ControlPoint);
-            bytes += plan.modulation.size() * sizeof(VoiceModulation);
+            const auto bytes = sizes.empty() ? footprint(plan) : sizes[job];
             const auto limit = jobs.empty() && natural ? singleJobBudget : budget;
             if (estimated >= limit || bytes > limit - estimated)
                 break;
+            if (!sizes.empty() && plan.volumeGroup && (job == first || plans[job - 1].volumeGroup != plan.volumeGroup)) {
+                auto end = job;
+                size_t groupBytes = 0;
+                for (; end < stop && plans[end].volumeGroup == plan.volumeGroup; ++end)
+                    groupBytes += sizes[end];
+                if (end - first > 64 || groupBytes > budget - std::min(budget, estimated)) {
+                    if (!jobs.empty())
+                        break;
+                    // A split starts with this group and never keeps unrelated PCM waiting.
+                    stop = end;
+                }
+            }
+            const auto jobBlocks = int(blocksFor(plan.frames, tailBlockFrames));
+            const auto jobWindows = natural ? int(blocksFor(plan.frames, tail.window)) : 0;
+            const int body = audio.enabled || plan.volumeGroup ? plan.bodyFrames : 0;
+            const int jobBodyBlocks = bodyWindows(body);
             jobs.push_back({index.frames, plan.frames, plan.musicEnd, plan.limit, plan.fadeFrames, blocks, windows});
+            if (assess) {
+                audioJobs.push_back({body, bodyBlocks, int(onsets.size()), int(plan.onsets.size())});
+                onsets.insert(onsets.end(), plan.onsets.begin(), plan.onsets.end());
+                bodyBlocks += jobBodyBlocks;
+            }
             index.append(plan, threads);
             estimated += bytes;
             blocks += jobBlocks;
@@ -521,8 +600,13 @@ struct Renderer::Impl {
         const auto monoOffset = layout.section(monoBytes);
         const auto statsOffset = layout.section(natural ? blocks * sizeof(StereoStats) : 0);
         const auto windowOffset = layout.section(windows * sizeof(MonoStats));
+        const auto audioOffset = reserve(audioJobs), onsetOffset = reserve(onsets);
+        const auto bodyPowerOffset = layout.section(size_t(bodyBlocks) * sizeof(unsigned long long));
+        const auto onsetPowerOffset = layout.section(onsets.size() * sizeof(unsigned long long));
+        const auto pcmJobOffset = layout.section(assess ? jobs.size() * sizeof(PcmJob) : 0);
+        const auto stereoOutput = layout.section(assess && !natural ? index.frames * frameBytes : 0);
         arena.allocate(layout.bytes);
-        peak = std::max(peak, sinc.capacity + samples.capacity + arena.capacity);
+        recordPeak();
         const auto upload = [&](size_t offset, const auto& items) {
             auto address = arena.address + offset;
             if (!items.empty())
@@ -538,7 +622,7 @@ struct Renderer::Impl {
         auto mono = natural ? arena.address + monoOffset : mix;
         // After mono conversion the float mix is dead, so its allocation also holds the compact PCM.
         auto packed = mix;
-        TimingEvent begin(driver), end(driver);
+        auto assessment = upload(audioOffset, audioJobs), starts = upload(onsetOffset, onsets);
         begin.record();
         if (index.filteredFrames) {
             int heads = static_cast<int>(index.filterHeads.size());
@@ -571,36 +655,265 @@ struct Renderer::Impl {
         void* layoutArgs[] = {&jobData, &count, &resultData};
         driver.check(driver.launch(pcmLayout, 1, 1, 1, 1, 1, 1, 0, nullptr, layoutArgs, nullptr), "CUDA PCM layout launch");
         launchChunks(pcmFinalize, blocks, 128, jobData, count, mono, packed, resultData);
-        end.record();
-        RenderBatch batch;
-        batch.results.resize(count);
-        driver.check(driver.get(batch.results.data(), resultData, count * sizeof(TailResult)), "CUDA tail metadata download");
-        const auto& last = batch.results.back();
-        batch.pcm = receivePcm(packed, (last.offset + last.dataFrames) * (natural ? 1 : 2));
+        if (assess) {
+            auto bodyPower = arena.address + bodyPowerOffset, onsetPower = arena.address + onsetPowerOffset;
+            launchChunks(bodyMeasure, bodyBlocks, 128, assessment, count, packed, resultData, bodyPower, audio);
+            if (audio.enabled)
+                launchChunks(onsetMeasure, int(onsets.size()), 160, assessment, count, starts, packed,
+                    resultData, onsetPower, audio.window);
+            void* args[] = {&assessment, &count, &bodyPower, &onsetPower, &resultData, &audio};
+            driver.check(driver.launch(audioSummary, (count + 31) / 32, 1, 1, 32, 1, 1, 0, nullptr, args, nullptr),
+                "CUDA audio assessment launch");
+        }
+        synthesis.jobData = jobData;
+        synthesis.resultData = resultData;
+        synthesis.source = packed;
+        synthesis.output = natural ? mono : arena.address + stereoOutput;
+        synthesis.pcmJobs = arena.address + pcmJobOffset;
+        synthesis.blocks = blocks;
+        return synthesis;
+    }
+
+    void pack(Synthesis& work)
+    {
+        int count = static_cast<int>(work.jobs.size());
+        void* args[] = {&work.jobData, &count, &work.resultData, &work.pcmJobs};
+        driver.check(driver.launch(acceptedLayout, 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr),
+            "CUDA accepted PCM layout launch");
+        launchChunks(acceptedPack, work.blocks, 128, work.pcmJobs, count, work.source, work.output, work.resultData);
+    }
+
+    void match(DevicePtr groups, int count, int base, DevicePtr results)
+    {
+        void* args[] = {&groups, &count, &base, &groupMinimum, &results};
+        driver.check(driver.launch(volumeMatch, (count + 31) / 32, 1, 1, 32, 1, 1, 0, nullptr, args, nullptr),
+            "CUDA group volume launch");
+    }
+
+    std::vector<TailResult> readResults(const Synthesis& work)
+    {
+        std::vector<TailResult> results(work.jobs.size());
+        driver.check(driver.get(results.data(), work.resultData, results.size() * sizeof(TailResult)),
+            "CUDA render metadata download");
+        return results;
+    }
+
+    size_t packedSamples(const std::vector<TailResult>& results) const
+    {
+        const auto& last = results.back();
+        return (last.offset + last.dataFrames) * channels();
+    }
+
+    double timing(const TimingEvent& begin, const TimingEvent& end)
+    {
         float milliseconds{};
         driver.check(driver.elapsedEvents(&milliseconds, begin.address, end.address), "CUDA kernel timing");
-        batch.kernelSeconds = milliseconds / 1000.;
-        return batch;
+        return milliseconds / 1000.;
+    }
+
+    RenderBatch download(const Synthesis& work, DevicePtr pcm, const TimingEvent& begin, const TimingEvent& end)
+    {
+        auto results = readResults(work);
+        const auto count = packedSamples(results);
+        auto samples = receivePcm(pcm, count);
+        downloaded += count * sizeof(int16_t);
+        return {std::move(samples), std::move(results), timing(begin, end)};
+    }
+
+    RenderBatch render(const std::vector<RenderPlan>& plans, size_t first)
+    {
+        TimingEvent begin(driver), end(driver);
+        auto work = synthesize(plans, first, plans.size(), begin);
+        if (audio.enabled || groupMinimum)
+            pack(work);
+        end.record();
+        return download(work, audio.enabled || groupMinimum ? work.output : work.source, begin, end);
+    }
+
+    struct Retained {
+        std::vector<TailJob> jobs;
+        size_t first, bytes;
+        int blocks;
+        std::unique_ptr<Buffer> device;
+        std::shared_ptr<int16_t> host;
+    };
+
+    Retained retain(Synthesis& work, size_t first, DevicePtr destination, const TimingEvent& end)
+    {
+        pack(work);
+        const auto resultBytes = work.jobs.size() * sizeof(TailResult);
+        driver.check(driver.copy(destination, work.resultData, resultBytes), "CUDA retain group metadata");
+        end.record();
+        TailResult last{};
+        driver.check(driver.get(&last, destination + resultBytes - sizeof(last), sizeof(last)), "CUDA retained PCM size");
+        const auto count = (last.offset + last.dataFrames) * channels();
+        const auto bytes = count * sizeof(int16_t);
+        Retained chunk{std::move(work.jobs), first, bytes, work.blocks, {}, {}};
+        if (bytes) {
+            size_t free{}, total{};
+            driver.check(driver.memory(&free, &total), "CUDA waiting memory budget");
+            const auto limit = std::min(waitingLimit, total / 16);
+            if (waiting <= limit && bytes <= std::min(limit - waiting, free / 4)) {
+                auto device = std::make_unique<Buffer>(driver);
+                if (!driver.allocate(&device->address, bytes)) {
+                    device->capacity = bytes;
+                    waiting += bytes;
+                    peakWaiting = std::max(peakWaiting, waiting);
+                    recordPeak();
+                    driver.check(driver.copy(device->address, work.output, bytes), "CUDA retain group PCM");
+                    chunk.device = std::move(device);
+                }
+            }
+            if (!chunk.device) {
+                chunk.host = receivePcm(work.output, count);
+                spilled += bytes;
+            }
+        }
+        return chunk;
+    }
+
+    size_t finishSplit(const std::vector<RenderPlan>& plans, const std::vector<size_t>& sizes, Synthesis work,
+                       const AudioGroup& group, DevicePtr groupData, DevicePtr resultData, const TimingEvent& firstBegin,
+                       const std::function<void(RenderBatch, size_t)>& publish)
+    {
+        std::vector<Retained> chunks;
+        TimingEvent firstEnd(driver);
+        auto next = group.first + work.jobs.size();
+        chunks.push_back(retain(work, group.first, resultData, firstEnd));
+        double synthSeconds = timing(firstBegin, firstEnd);
+        for (auto first = next; first < size_t(group.end); first = next) {
+            TimingEvent begin(driver), end(driver);
+            work = synthesize(plans, first, group.end, begin, sizes);
+            next = first + work.jobs.size();
+            const auto destination = resultData + (first - group.first) * sizeof(TailResult);
+            if (next == size_t(group.end)) {
+                driver.check(driver.copy(destination, work.resultData, work.jobs.size() * sizeof(TailResult)),
+                    "CUDA complete group metadata");
+                work.resultData = destination;
+                match(groupData, 1, group.first, resultData);
+                pack(work);
+                end.record();
+                auto batch = download(work, work.output, begin, end);
+                batch.kernelSeconds += synthSeconds;
+                publish(std::move(batch), first);
+                break;
+            }
+            chunks.push_back(retain(work, first, destination, end));
+            synthSeconds += timing(begin, end);
+        }
+        // The last chunk can be packed directly. Only earlier chunks had to wait.
+        for (auto& chunk : chunks) {
+            ArenaLayout layout;
+            const auto jobBytes = chunk.jobs.size() * sizeof(TailJob);
+            const auto jobOffset = layout.section(jobBytes);
+            const auto pcmOffset = layout.section(chunk.jobs.size() * sizeof(PcmJob));
+            const auto sourceOffset = layout.section(chunk.host ? chunk.bytes : 0);
+            const auto outputOffset = layout.section(chunk.bytes);
+            arena.allocate(layout.bytes);
+            recordPeak();
+            Synthesis work{std::move(chunk.jobs), arena.address + jobOffset,
+                resultData + (chunk.first - group.first) * sizeof(TailResult),
+                chunk.device ? chunk.device->address : arena.address + sourceOffset, arena.address + outputOffset,
+                arena.address + pcmOffset, chunk.blocks};
+            driver.check(driver.put(work.jobData, work.jobs.data(), jobBytes), "CUDA retained job upload");
+            if (chunk.host)
+                driver.check(driver.put(work.source, chunk.host.get(), chunk.bytes), "CUDA spilled PCM upload");
+            TimingEvent begin(driver), end(driver);
+            begin.record();
+            pack(work);
+            end.record();
+            auto batch = download(work, work.output, begin, end);
+            if (chunk.device) {
+                waiting -= chunk.bytes;
+                chunk.device.reset();
+            }
+            chunk.host.reset();
+            publish(std::move(batch), chunk.first);
+        }
+        return next;
+    }
+
+    void renderWindow(const std::vector<RenderPlan>& plans, const std::function<void(RenderBatch, size_t)>& publish)
+    {
+        std::vector<AudioGroup> groups;
+        size_t largest = 0;
+        for (size_t first = 0, end = 0; first < plans.size(); first = end) {
+            const auto id = plans[first].volumeGroup;
+            end = first + 1;
+            if (!id)
+                continue;
+            while (end < plans.size() && plans[end].volumeGroup == id)
+                ++end;
+            groups.push_back({int(first), int(end)});
+            largest = std::max(largest, end - first);
+        }
+        if (groups.empty()) {
+            for (size_t first = 0; first < plans.size();) {
+                auto batch = render(plans, first);
+                const auto next = first + batch.results.size();
+                publish(std::move(batch), first);
+                first = next;
+            }
+            return;
+        }
+        std::vector<size_t> sizes;
+        sizes.reserve(plans.size());
+        for (const auto& plan : plans)
+            sizes.push_back(footprint(plan));
+        ArenaLayout control;
+        const auto groupOffset = control.section(groups.size() * sizeof(AudioGroup));
+        const auto resultOffset = control.section(largest * sizeof(TailResult));
+        groupControl.allocate(control.bytes);
+        recordPeak();
+        const auto groupData = groupControl.address + groupOffset;
+        const auto resultData = groupControl.address + resultOffset;
+        driver.check(driver.put(groupData, groups.data(), groups.size() * sizeof(AudioGroup)), "CUDA group upload");
+        size_t group = 0;
+        for (size_t first = 0; first < plans.size();) {
+            TimingEvent begin(driver), end(driver);
+            auto work = synthesize(plans, first, plans.size(), begin, sizes);
+            const auto next = first + work.jobs.size();
+            const auto groupStart = group;
+            while (group < groups.size() && size_t(groups[group].end) <= next)
+                ++group;
+            if (group < groups.size() && size_t(groups[group].first) < next) {
+                first = finishSplit(plans, sizes, std::move(work), groups[group], groupData + group * sizeof(AudioGroup),
+                    resultData, begin, publish);
+                ++group;
+                continue;
+            }
+            if (group != groupStart)
+                match(groupData + groupStart * sizeof(AudioGroup), int(group - groupStart), int(first), work.resultData);
+            pack(work);
+            end.record();
+            publish(download(work, work.output, begin, end), first);
+            first = next;
+        }
     }
 };
 
-Renderer::Renderer(int device, const Path& nvrtc, bool natural, int rate)
-    : impl_(std::make_unique<Impl>(device, nvrtc, natural, rate))
+Renderer::Renderer(int device, const Path& nvrtc, bool natural, AudioConfig audio, int groupMinimum,
+                   size_t waitingLimit)
+    : impl_(std::make_unique<Impl>(device, nvrtc, natural, audio, groupMinimum, waitingLimit))
 {
 }
 
 Renderer::~Renderer() = default;
 
-void Renderer::uploadSamples(const AudioBank& bank)
+void Renderer::uploadSamples(const AudioBank& bank, bool fresh)
 {
-    impl_->uploadSamples(bank);
+    impl_->uploadSamples(bank, fresh);
 }
 
-RenderBatch Renderer::render(const std::vector<RenderPlan>& plans, size_t first)
+void Renderer::renderWindow(const std::vector<RenderPlan>& plans, const std::function<void(RenderBatch, size_t)>& publish)
 {
-    return impl_->render(plans, first);
+    impl_->renderWindow(plans, publish);
 }
 const std::string& Renderer::device() const { return impl_->deviceName; }
 size_t Renderer::peakBytes() const { return impl_->peak; }
+size_t Renderer::sampleCacheBudget() const { return impl_->cacheBudget; }
+size_t Renderer::peakWaitingBytes() const { return impl_->peakWaiting; }
+size_t Renderer::spilledBytes() const { return impl_->spilled; }
+size_t Renderer::downloadedBytes() const { return impl_->downloaded; }
 
 } // namespace clay

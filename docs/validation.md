@@ -70,6 +70,30 @@ The performance workloads produced byte-identical WAVs against the baseline. The
 
 The 63-clip piano warm CUDA interval grew from 0.179 s to 0.199 s, including GPU tail finishing. The total pass fell from 1.669 s to 0.308 s. Peak explicit device allocations rose from 1196 MiB to 1471 MiB. The host download now carries mono PCM16 at two bytes per copied frame in `natural`, compared with eight bytes for the prior stereo float path.
 
+## GPU quality and group volume
+
+```sh
+python tests/check_group_audio.py --clay build/claysampler
+```
+
+The generated cases cover opt-in quality, custom thresholds, quiet and clipped rejection, duration and body silence, peak-limited gain, stereo output, an incomplete group and a group larger than one CUDA batch. The oversized group produces identical WAVs with device retention and with forced host staging. A fully rejected batch reports zero downloaded PCM. NVRTC 12.4 compiled both output modes with the two features enabled for `sm_75`, `sm_86`, `sm_89` and `compute_90`.
+
+On the RTX 4080 Laptop GPU, 16 real VCSL melodies were each rendered with Steinway B, Concert Harp and Marimba. The CPU reference ran ClayEngine's quality check and group RMS rules on ClaySampler's unadjusted WAVs. It agreed with the GPU's three rejections and all 45 accepted PCM streams matched byte for byte after gain. A separate 16-file comparison of the default single-preset mode with `8d437c2` also matched byte for byte.
+
+The median warm pass was about 0.91 s with both options off and 0.93 s with both on, including WAV writes. The separate CPU check and gain computation on existing WAVs took about 1.52 s, excluding writes of the adjusted WAVs. This compares the post-processing paths on the same synthesis output. The GPU path downloaded 136.2 MiB of final PCM per pass, used no host staging, and peaked at about 506 MiB of explicit device allocations.
+
+### ClayEngine batch comparison
+
+A separate run submitted the same 48 jobs to ClayEngine's `render_planned` using sfizz 1.2.3 with 16 CPU workers, and to ClaySampler with both GPU options enabled. Both paths rendered at 44.1 kHz, finished tails, ran the audio gate, matched group volume and wrote WAVs. The inputs were fixed in advance, so the timing excludes candidate selection and replacement. The CPU timing starts with ClayEngine already loaded. Its benchmark wrapper bypasses only the suppression of sfizz's freewheeling log line.
+
+| Path | Batch time | Speedup over ClayEngine |
+| --- | ---: | ---: |
+| ClayEngine, 16 CPU workers, one run | 32.75 s | 1× |
+| ClaySampler, median of two fresh processes including startup | 2.02 s | 16.2× |
+| ClaySampler, median of three passes reusing the process and sample cache | 0.94 s | 34.9× |
+
+Both renderers rejected the same three jobs and wrote the same 45 job outputs. The batch comparison checked acceptance and output counts. The byte-for-byte comparison above used the same synthesis output to validate post-processing.
+
 ## Preset audit
 
 The audit uses the host-only ClaySampler loader and the sfizz C API on the same paths. It records accepted region counts, ClaySampler rejection reasons and unknown opcodes reported by sfizz. The result measures loading and sample resolution. Use the audio comparison harness for MIDI-specific behavior and sound.

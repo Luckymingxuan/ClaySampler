@@ -174,7 +174,48 @@ void prepareNatural(std::vector<Message>& messages)
     messages.push_back({end, 0, 0, 0});
 }
 
-Midi readFile(std::string_view data, int rate, TailPolicy tail)
+void analyzeAudio(const std::vector<Message>& messages, int rate, int division, Midi& midi)
+{
+    struct Pending { int start, next; };
+    std::vector<Pending> pending{{}};
+    std::array<int, 16 * 128> head{}, tail{};
+    int tempo = 500000;
+    uint64_t previousTick = 0;
+    double seconds = 0;
+    for (const auto& message : messages) {
+        seconds += double(message.tick - previousTick) * (tempo * 1e-6 / division);
+        previousTick = message.tick;
+        if (message.status == 255) {
+            tempo = message.a;
+            continue;
+        }
+        const int type = message.status >> 4;
+        if (type != 8 && type != 9)
+            continue;
+        if (seconds * rate >= std::numeric_limits<int>::max() / 2)
+            throw std::runtime_error("MIDI exceeds maximum render duration");
+        const int frame = static_cast<int>(std::nearbyint(seconds * rate));
+        const int key = (message.status & 15) * 128 + message.a;
+        if (type == 9 && message.b) {
+            const auto index = int(pending.size());
+            if (head[key])
+                pending[tail[key]].next = index;
+            else
+                head[key] = index;
+            tail[key] = index;
+            pending.push_back({frame, 0});
+        } else if (head[key]) {
+            const auto note = pending[head[key]];
+            midi.onsets.push_back(note.start);
+            head[key] = note.next;
+            midi.bodyFrames = std::max(midi.bodyFrames, frame);
+        }
+    }
+    std::sort(midi.onsets.begin(), midi.onsets.end());
+    midi.onsets.erase(std::unique(midi.onsets.begin(), midi.onsets.end()), midi.onsets.end());
+}
+
+Midi readFile(std::string_view data, int rate, TailPolicy tail, bool measure)
 {
     Bytes file(data);
     if (file.take(4) != "MThd")
@@ -193,6 +234,9 @@ Midi readFile(std::string_view data, int rate, TailPolicy tail)
     }
     std::stable_sort(messages.begin(), messages.end(),
         [](const Message& a, const Message& b) { return a.tick < b.tick; });
+    Midi result;
+    if (measure)
+        analyzeAudio(messages, rate, division, result);
     if (tail == TailPolicy::natural)
         prepareNatural(messages);
     if (tail == TailPolicy::custom) {
@@ -208,7 +252,6 @@ Midi readFile(std::string_view data, int rate, TailPolicy tail)
             messages.push_back({tick, 0, 0, 0});
         }
     }
-    Midi result;
     uint64_t previousTick = 0;
     double frames = 0;
     double scale = rate / (1000000.0 * division);
@@ -257,14 +300,14 @@ Midi readFile(std::string_view data, int rate, TailPolicy tail)
 
 } // namespace
 
-Midi loadMidi(const std::filesystem::path& path, int rate, TailPolicy tail)
+Midi loadMidi(const std::filesystem::path& path, int rate, TailPolicy tail, bool measure)
 {
     std::ifstream file(path, std::ios::binary);
     if (!file)
         throw std::runtime_error("cannot open MIDI " + path.u8string());
     const std::string data{std::istreambuf_iterator<char>(file), {}};
     try {
-        return readFile(data, rate, tail);
+        return readFile(data, rate, tail, measure);
     } catch (const std::exception& error) {
         throw std::runtime_error(path.u8string() + ": " + error.what());
     }

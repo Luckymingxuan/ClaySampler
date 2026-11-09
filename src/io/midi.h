@@ -19,8 +19,10 @@ struct Event {
 struct Midi {
     std::vector<Event> events;
     int end = 0;
+    int bodyFrames = 0;
+    std::vector<int> onsets;
 };
 
-Midi loadMidi(const std::filesystem::path& path, int rate, TailPolicy tail);
+Midi loadMidi(const std::filesystem::path& path, int rate, TailPolicy tail, bool measure = false);
 
 } // namespace clay
