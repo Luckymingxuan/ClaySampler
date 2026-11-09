@@ -1,0 +1,121 @@
+name: Windows build and release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v[0-9]*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Select package version
+        id: version
+        shell: pwsh
+        run: |
+          $version = 'dev'
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME
+            if ($version -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+              throw 'Release tag must use vMAJOR.MINOR.PATCH'
+            }
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Zig 0.15.2
+        shell: pwsh
+        run: |
+          $tool = 'zig-x86_64-windows-0.15.2'
+          $archive = Join-Path $env:RUNNER_TEMP "$tool.zip"
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest "https://ziglang.org/download/0.15.2/$tool.zip" -OutFile $archive
+          $expected = '3a0ed1e8799a2f8ce2a6e6290a9ff22e6906f8227865911fb7ddedc3cc14cb0c'
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) {
+            throw 'Zig archive SHA-256 mismatch'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $env:RUNNER_TEMP
+          $zig = Join-Path $env:RUNNER_TEMP "$tool/zig.exe"
+          "ZIG_EXE=$zig" >> $env:GITHUB_ENV
+
+      - name: Configure Windows x64
+        shell: pwsh
+        run: |
+          $configure = @(
+            '-S', '.', '-B', 'build/windows', '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release'
+            "-DCMAKE_CXX_COMPILER=$env:ZIG_EXE", '-DCMAKE_CXX_COMPILER_ARG1=c++'
+            '-DCMAKE_CXX_FLAGS=--target=x86_64-windows-gnu'
+          )
+          cmake @configure
+
+      - name: Build
+        run: cmake --build build/windows
+
+      - name: Package
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: python -B scripts/package_windows.py --exe build/windows/claysampler.exe --version $env:PACKAGE_VERSION --output build/release
+
+      - name: Verify the extracted package
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: python -B tests/check_windows_package.py "build/release/claysampler-${env:PACKAGE_VERSION}-win64.zip"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: claysampler-win64
+          path: |
+            build/release/claysampler-${{ steps.version.outputs.version }}-win64.zip
+            build/release/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: windows
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the tag points to a main commit
+        run: git merge-base --is-ancestor HEAD origin/main
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: claysampler-win64
+          path: release
+
+      - name: Verify the archive checksum
+        working-directory: release
+        run: sha256sum --check SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.windows.outputs.version }}
+        run: |
+          gh release create "$RELEASE_TAG" "release/claysampler-$RELEASE_TAG-win64.zip" "release/SHA256SUMS.txt" \
+            --verify-tag --title "ClaySampler $RELEASE_TAG" --generate-notes \
+            --notes "$(cat .github/release-notes.md)"

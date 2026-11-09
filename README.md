@@ -4,6 +4,8 @@ ClaySampler renders batches of MIDI files through SFZ instruments on NVIDIA CUDA
 
 The current implementation covers a tested SFZ subset. See [compatibility](docs/compatibility.md) for accepted features and [validation](docs/validation.md) for the sfizz benchmark and listening report.
 
+The Windows workflow publishes x64 ZIPs and SHA-256 files as [GitHub Release assets](https://github.com/Luckymingxuan/ClaySampler/releases). See the [release guide](docs/releasing.md) for packaging and verification.
+
 ## Build and render
 
 Build with CMake 3.20 or newer and a C++17 compiler. At runtime the executable needs an NVIDIA driver, NVRTC with its matching builtins library, and libsndfile. The executable contains the CUDA source and compiles it for the selected GPU. The validation scripts use Python.
