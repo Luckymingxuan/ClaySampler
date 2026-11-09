@@ -1,0 +1,15 @@
+#pragma once
+
+namespace clay {
+
+inline constexpr char kernelSource[] = R"CLAY_CUDA(
+@CLAY_CUDA_SOURCE@
+@CLAY_CUDA_TAIL@
+@CLAY_CUDA_QUALITY@
+)CLAY_CUDA";
+
+inline constexpr char kernelTypes[] = R"CLAY_CUDA(
+@CLAY_CUDA_TYPES@
+)CLAY_CUDA";
+
+} // namespace clay
