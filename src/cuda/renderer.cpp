@@ -3,11 +3,21 @@
 #include "kernel_source.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
+#include <string_view>
 #include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 namespace clay {
 namespace {
@@ -15,6 +25,7 @@ namespace {
 using DevicePtr = unsigned long long;
 using Handle = void*;
 using Path = std::filesystem::path;
+constexpr int cudaOutOfMemory = 2;
 
 #ifdef _WIN32
 constexpr auto driverName = "nvcuda.dll";
@@ -30,6 +41,7 @@ struct Driver {
     int (*attribute)(int*, int, int) = lib.get<int(*)(int*, int, int)>("cuDeviceGetAttribute");
     int (*create)(Handle*, unsigned, int) = lib.get<int(*)(Handle*, unsigned, int)>("cuCtxCreate_v2");
     int (*destroy)(Handle) = lib.get<int(*)(Handle)>("cuCtxDestroy_v2");
+    int (*synchronize)() = lib.get<int(*)()>("cuCtxSynchronize");
     int (*load)(Handle*, const void*) = lib.get<int(*)(Handle*, const void*)>("cuModuleLoadData");
     int (*kernel)(Handle*, Handle, const char*) = lib.get<int(*)(Handle*, Handle, const char*)>("cuModuleGetFunction");
     int (*memory)(size_t*, size_t*) = lib.get<int(*)(size_t*, size_t*)>("cuMemGetInfo_v2");
@@ -39,6 +51,8 @@ struct Driver {
     int (*get)(void*, DevicePtr, size_t) = lib.get<int(*)(void*, DevicePtr, size_t)>("cuMemcpyDtoH_v2");
     int (*copy)(DevicePtr, DevicePtr, size_t) = lib.get<int(*)(DevicePtr, DevicePtr, size_t)>("cuMemcpyDtoD_v2");
     int (*allocHost)(void**, size_t) = lib.get<int(*)(void**, size_t)>("cuMemAllocHost_v2");
+    int (*allocMapped)(void**, size_t, unsigned) = lib.get<int(*)(void**, size_t, unsigned)>("cuMemHostAlloc");
+    int (*mappedAddress)(DevicePtr*, void*, unsigned) = lib.get<int(*)(DevicePtr*, void*, unsigned)>("cuMemHostGetDevicePointer_v2");
     int (*freeHost)(void*) = lib.get<int(*)(void*)>("cuMemFreeHost");
     using Occupancy = int(*)(int*, int*, Handle, size_t(*)(int), size_t, int);
     Occupancy occupancy = lib.get<Occupancy>("cuOccupancyMaxPotentialBlockSize");
@@ -92,12 +106,22 @@ public:
 
     void allocate(size_t bytes)
     {
+        driver_.check(tryAllocate(bytes), "CUDA allocation");
+    }
+
+    int tryAllocate(size_t bytes)
+    {
         bytes = std::max(bytes, size_t{1});
         if (bytes <= capacity)
-            return;
+            return 0;
         reset();
-        driver_.check(driver_.allocate(&address, bytes), "CUDA allocation");
+        DevicePtr allocation{};
+        const auto error = driver_.allocate(&allocation, bytes);
+        if (error)
+            return error;
+        address = allocation;
         capacity = bytes;
+        return 0;
     }
 
     void reset()
@@ -129,15 +153,19 @@ struct HostPcm {
     size_t capacity{};
 
     explicit HostPcm(Driver& owner) : driver(owner) {}
-    ~HostPcm() { if (address) driver.freeHost(address); }
-    bool reserve(size_t bytes)
+    ~HostPcm() { reset(); }
+    void reset()
     {
-        if (bytes <= capacity)
-            return true;
         if (address)
             driver.freeHost(address);
         address = nullptr;
         capacity = 0;
+    }
+    bool reserve(size_t bytes)
+    {
+        if (bytes <= capacity)
+            return true;
+        reset();
         void* allocation{};
         if (driver.allocHost(&allocation, bytes))
             return false;
@@ -161,21 +189,60 @@ struct ArenaLayout {
 
 size_t blocksFor(size_t frames, size_t block) { return (frames + block - 1) / block; }
 
-std::vector<char> compile(const Path& library, int architecture, bool floatingPoint, bool quality, bool grouping)
+Path kernelCache()
+{
+#ifdef _WIN32
+    const auto* local = _wgetenv(L"LOCALAPPDATA");
+    return local && *local ? Path(local) / "ClaySampler" / "kernels" : Path{};
+#else
+    if (const auto* local = std::getenv("XDG_CACHE_HOME"); local && *local)
+        return Path(local) / "claysampler" / "kernels";
+    const auto* home = std::getenv("HOME");
+    return home && *home ? Path(home) / ".cache" / "claysampler" / "kernels" : Path{};
+#endif
+}
+
+std::vector<char> readKernelCache(const Path& path)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    const auto bytes = file.tellg();
+    if (bytes <= 0 || bytes > 32 * 1024 * 1024)
+        return {};
+    std::vector<char> code(static_cast<size_t>(bytes) + 1);
+    if (!file.seekg(0).read(code.data(), static_cast<std::streamsize>(bytes)))
+        return {};
+    return code;
+}
+
+void writeKernelCache(const Path& path, const std::vector<char>& code)
+{
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    if (error)
+        return;
+#ifdef _WIN32
+    const auto process = GetCurrentProcessId();
+#else
+    const auto process = getpid();
+#endif
+    auto temporary = path;
+    temporary += "." + std::to_string(process) + "." +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".tmp";
+    std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+    file.write(code.data(), static_cast<std::streamsize>(code.size()));
+    file.close();
+    if (file)
+        std::filesystem::rename(temporary, path, error);
+    std::filesystem::remove(temporary, error);
+}
+
+void loadKernels(const Driver& driver, Handle& module, const Path& library, int architecture,
+                 bool floatingPoint, bool quality, bool grouping)
 {
     Library rtc(library);
     const auto version = rtc.get<int(*)(int*, int*)>("nvrtcVersion");
     int major{}, minor{};
     const bool hasVersion = version(&major, &minor) == 0;
-#ifdef _WIN32
-    std::unique_ptr<Library> builtins;
-    if (library.has_parent_path() && hasVersion) {
-        auto filename = "nvrtc-builtins64_" + std::to_string(major) + std::to_string(minor) + ".dll";
-        auto path = std::filesystem::absolute(library).parent_path() / filename;
-        if (std::filesystem::exists(path))
-            builtins = std::make_unique<Library>(path);
-    }
-#endif
     auto create = rtc.get<int(*)(Handle*, const char*, const char*, int, const char* const*, const char* const*)>("nvrtcCreateProgram");
     auto destroy = rtc.get<int(*)(Handle*)>("nvrtcDestroyProgram");
     auto run = rtc.get<int(*)(Handle, int, const char* const*)>("nvrtcCompileProgram");
@@ -200,6 +267,51 @@ std::vector<char> compile(const Path& library, int architecture, bool floatingPo
     auto sizeOf = rtc.get<int(*)(Handle, size_t*)>(native ? "nvrtcGetCUBINSize" : "nvrtcGetPTXSize");
     auto read = rtc.get<int(*)(Handle, char*)>(native ? "nvrtcGetCUBIN" : "nvrtcGetPTX");
 
+    auto archFlag = std::string(native ? "--gpu-architecture=sm_" : "--gpu-architecture=compute_") +
+        std::to_string(target);
+    const bool parallel = hasVersion && (major > 12 || (major == 12 && minor >= 4)) &&
+        std::thread::hardware_concurrency() >= 4;
+    const char* flags[] = {archFlag.c_str(), "--std=c++17", floatingPoint ? "-DCLAY_FLOAT_OUTPUT=1" : "-DCLAY_FLOAT_OUTPUT=0",
+        quality ? "-DCLAY_AUDIO_QA=1" : "-DCLAY_AUDIO_QA=0",
+        grouping ? "-DCLAY_GROUP_VOLUME=1" : "-DCLAY_GROUP_VOLUME=0", "--split-compile=4"};
+    auto cache = hasVersion ? kernelCache() : Path{};
+    if (!cache.empty()) {
+        uint64_t hash = 14695981039346656037ull;
+        const auto append = [&](std::string_view value) {
+            for (unsigned char byte : value)
+                hash = (hash ^ byte) * 1099511628211ull;
+            hash = (hash ^ 0xff) * 1099511628211ull;
+        };
+        append(kernelSource);
+        append(kernelTypes);
+        for (int i = 0; i < (parallel ? 6 : 5); ++i)
+            append(flags[i]);
+        append(library.u8string());
+        if (library.has_parent_path()) {
+            std::error_code error;
+            const auto updated = std::filesystem::last_write_time(library, error);
+            if (!error)
+                append(std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    updated.time_since_epoch()).count()));
+        }
+        cache /= std::to_string(major) + "-" + std::to_string(minor) + "-" + std::to_string(hash) + ".bin";
+        const auto cached = readKernelCache(cache);
+        if (!cached.empty()) {
+            if (!driver.load(&module, cached.data()))
+                return;
+            std::error_code error;
+            std::filesystem::remove(cache, error);
+        }
+    }
+#ifdef _WIN32
+    std::unique_ptr<Library> builtins;
+    if (library.has_parent_path() && hasVersion) {
+        auto filename = "nvrtc-builtins64_" + std::to_string(major) + std::to_string(minor) + ".dll";
+        auto path = std::filesystem::absolute(library).parent_path() / filename;
+        if (std::filesystem::exists(path))
+            builtins = std::make_unique<Library>(path);
+    }
+#endif
     const char* header = kernelTypes;
     const char* headerName = "render_types.h";
     Handle program = nullptr;
@@ -209,13 +321,6 @@ std::vector<char> compile(const Path& library, int architecture, bool floatingPo
         int (*destroy)(Handle*);
         ~Program() { destroy(&handle); }
     } scope{program, destroy};
-    auto archFlag = std::string(native ? "--gpu-architecture=sm_" : "--gpu-architecture=compute_") +
-        std::to_string(target);
-    const bool parallel = hasVersion && (major > 12 || (major == 12 && minor >= 4)) &&
-        std::thread::hardware_concurrency() >= 4;
-    const char* flags[] = {archFlag.c_str(), "--std=c++17", floatingPoint ? "-DCLAY_FLOAT_OUTPUT=1" : "-DCLAY_FLOAT_OUTPUT=0",
-        quality ? "-DCLAY_AUDIO_QA=1" : "-DCLAY_AUDIO_QA=0",
-        grouping ? "-DCLAY_GROUP_VOLUME=1" : "-DCLAY_GROUP_VOLUME=0", "--split-compile=4"};
     if (run(program, parallel ? 6 : 5, flags)) {
         size_t bytes{};
         check(logSize(program, &bytes));
@@ -227,7 +332,9 @@ std::vector<char> compile(const Path& library, int architecture, bool floatingPo
     check(sizeOf(program, &bytes));
     std::vector<char> result(bytes);
     check(read(program, result.data()));
-    return result;
+    driver.check(driver.load(&module, result.data()), "CUDA module");
+    if (!cache.empty())
+        writeKernelCache(cache, result);
 }
 
 std::vector<float> sincTable()
@@ -352,6 +459,8 @@ struct Renderer::Impl {
         ~Context() { if (address) driver.destroy(address); }
     } context{driver};
     Buffer samples{driver}, sinc{driver}, arena{driver}, groupControl{driver};
+    HostPcm mappedScratch{driver};
+    DevicePtr mappedBase{};
     std::vector<std::shared_ptr<HostPcm>> hostPcm;
     Handle module{}, kernel{}, filterSource{}, filterPass{}, pitchPass{};
     Handle stereoScan{}, nativeEnd{}, monoQuantize{}, trimEnd{}, pcmLayout{}, pcmFinalize{};
@@ -380,9 +489,9 @@ struct Renderer::Impl {
         int major{}, minor{};
         driver.check(driver.attribute(&major, 75, device), "CUDA architecture major");
         driver.check(driver.attribute(&minor, 76, device), "CUDA architecture minor");
-        driver.check(driver.create(&context.address, 0, device), "CUDA context");
-        auto code = compile(rtc, 10 * major + minor, natural, audio.enabled, groupMinimum > 0);
-        driver.check(driver.load(&module, code.data()), "CUDA module");
+        constexpr unsigned mapHost = 8; // CU_CTX_MAP_HOST
+        driver.check(driver.create(&context.address, mapHost, device), "CUDA context");
+        loadKernels(driver, module, rtc, 10 * major + minor, natural, audio.enabled, groupMinimum > 0);
         driver.check(driver.kernel(&kernel, module, "renderTiles"), "CUDA render kernel");
         driver.check(driver.kernel(&filterSource, module, "renderFilterSources"), "CUDA filter source kernel");
         driver.check(driver.kernel(&filterPass, module, "applyVoiceFilters"), "CUDA filter kernel");
@@ -457,6 +566,56 @@ struct Renderer::Impl {
         recordPeak();
     }
 
+    DevicePtr mapScratch(size_t bytes)
+    {
+        constexpr unsigned deviceMap = 2; // CU_MEMHOSTALLOC_DEVICEMAP
+        driver.check(driver.allocMapped(&mappedScratch.address, bytes, deviceMap), "CUDA mapped scratch allocation");
+        driver.check(driver.mappedAddress(&mappedBase, mappedScratch.address, 0), "CUDA mapped scratch address");
+        mappedScratch.capacity = bytes;
+        return mappedBase;
+    }
+
+    void releaseMappedScratch()
+    {
+        mappedScratch.reset();
+        mappedBase = 0;
+    }
+
+    char* mappedPointer(DevicePtr address) const
+    {
+        if (address >= mappedBase && address - mappedBase < mappedScratch.capacity)
+            return static_cast<char*>(mappedScratch.address) + (address - mappedBase);
+        return nullptr;
+    }
+
+    void uploadScratch(DevicePtr destination, const void* source, size_t bytes, const char* operation)
+    {
+        if (auto* host = mappedPointer(destination))
+            std::memcpy(host, source, bytes);
+        else
+            driver.check(driver.put(destination, source, bytes), operation);
+    }
+
+    void downloadScratch(void* destination, DevicePtr source, size_t bytes, const char* operation)
+    {
+        if (const auto* host = mappedPointer(source)) {
+            driver.check(driver.synchronize(), operation);
+            std::memcpy(destination, host, bytes);
+        } else {
+            driver.check(driver.get(destination, source, bytes), operation);
+        }
+    }
+
+    void copyScratch(DevicePtr destination, DevicePtr source, size_t bytes, const char* operation)
+    {
+        if (const auto* host = mappedPointer(source)) {
+            driver.check(driver.synchronize(), operation);
+            driver.check(driver.put(destination, host, bytes), operation);
+        } else {
+            driver.check(driver.copy(destination, source, bytes), operation);
+        }
+    }
+
     std::shared_ptr<int16_t> receivePcm(DevicePtr source, size_t samplesCount)
     {
         if (!samplesCount)
@@ -473,7 +632,7 @@ struct Renderer::Impl {
         }
         if (!pcm)
             pcm = std::shared_ptr<int16_t>(new int16_t[samplesCount], std::default_delete<int16_t[]>());
-        driver.check(driver.get(pcm.get(), source, bytes), "CUDA PCM download");
+        downloadScratch(pcm.get(), source, bytes, "CUDA PCM download");
         return pcm;
     }
 
@@ -534,15 +693,15 @@ struct Renderer::Impl {
     }
 
     Synthesis synthesize(const std::vector<RenderPlan>& plans, size_t first, size_t stop, const TimingEvent& begin,
-                         const std::vector<size_t>& sizes = {})
+                         const std::vector<size_t>& sizes = {}, size_t maxJobs = 64)
     {
         const auto frameBytes = 2 * (natural ? sizeof(float) : sizeof(int16_t));
         size_t free{}, total{};
         driver.check(driver.memory(&free, &total), "CUDA free memory");
-        constexpr size_t mib = 1024 * 1024;
         const auto available = free + arena.capacity;
-        const auto budget = std::min(available / 2, std::clamp(total / 12, 512 * mib, 1024 * mib));
-        const auto singleJobBudget = std::min(available - available / 3, budget + budget / 3);
+        // Keep routine batches bounded by both the device size and current memory pressure.
+        // A large job gets its own batch and tries the exact arena allocation below.
+        const auto budget = std::min(available / 2, total / 8);
         size_t estimated = 0;
         BatchIndex index;
         Synthesis synthesis;
@@ -551,18 +710,17 @@ struct Renderer::Impl {
         std::vector<AudioJob> audioJobs;
         std::vector<int> onsets;
         int blocks = 0, windows = 0, bodyBlocks = 0;
-        for (size_t job = first; job < stop && jobs.size() < 64; ++job) {
+        for (size_t job = first; job < stop && jobs.size() < maxJobs; ++job) {
             const auto& plan = plans[job];
             const auto bytes = sizes.empty() ? footprint(plan) : sizes[job];
-            const auto limit = jobs.empty() && natural ? singleJobBudget : budget;
-            if (estimated >= limit || bytes > limit - estimated)
+            if (!jobs.empty() && (estimated >= budget || bytes > budget - estimated))
                 break;
             if (!sizes.empty() && plan.volumeGroup && (job == first || plans[job - 1].volumeGroup != plan.volumeGroup)) {
                 auto end = job;
                 size_t groupBytes = 0;
                 for (; end < stop && plans[end].volumeGroup == plan.volumeGroup; ++end)
                     groupBytes += sizes[end];
-                if (end - first > 64 || groupBytes > budget - std::min(budget, estimated)) {
+                if (end - first > maxJobs || groupBytes > budget - std::min(budget, estimated)) {
                     if (!jobs.empty())
                         break;
                     // A split starts with this group and never keeps unrelated PCM waiting.
@@ -584,16 +742,12 @@ struct Renderer::Impl {
             blocks += jobBlocks;
             windows += jobWindows;
         }
-        if (jobs.empty())
-            throw std::runtime_error("one render job exceeds the CUDA batch memory budget");
         int count = static_cast<int>(jobs.size());
         ArenaLayout layout;
         const auto reserve = [&](const auto& items) { return layout.section(items.size() * sizeof(items.front())); };
         const auto voiceOffset = reserve(index.voices), tileOffset = reserve(index.tiles), indexOffset = reserve(index.indices);
         const auto controlOffset = reserve(index.controls), modulationOffset = reserve(index.modulation);
         const auto filterTileOffset = reserve(index.filterTiles), filterHeadOffset = reserve(index.filterHeads);
-        const auto filteredOffset = layout.section(index.filteredFrames * 2 * sizeof(float));
-        const auto phaseOffset = layout.section(index.pitchFrames * sizeof(double));
         const auto mixOffset = layout.section(index.frames * frameBytes);
         const auto jobOffset = reserve(jobs), resultOffset = layout.section(count * sizeof(TailResult));
         const auto monoBytes = natural ? index.frames * sizeof(int16_t) : 0;
@@ -605,21 +759,42 @@ struct Renderer::Impl {
         const auto onsetPowerOffset = layout.section(onsets.size() * sizeof(unsigned long long));
         const auto pcmJobOffset = layout.section(assess ? jobs.size() * sizeof(PcmJob) : 0);
         const auto stereoOutput = layout.section(assess && !natural ? index.frames * frameBytes : 0);
-        arena.allocate(layout.bytes);
+        const auto baseBytes = layout.bytes;
+        const auto filteredBytes = index.filteredFrames * 2 * sizeof(float);
+        const auto phaseBytes = index.pitchFrames * sizeof(double);
+        const auto filteredOffset = layout.section(filteredBytes);
+        const auto phaseOffset = layout.section(phaseBytes);
+        auto allocation = arena.tryAllocate(layout.bytes);
+        if (allocation == cudaOutOfMemory && jobs.size() > 1)
+            return synthesize(plans, first, stop, begin, sizes, jobs.size() / 2);
+        DevicePtr filterScratch{};
+        if (allocation == cudaOutOfMemory && filteredBytes) {
+            // Filter and pitch scratch account for most of a dense job's memory.
+            // Kernels can access it directly in host memory while the mix stays on the device.
+            allocation = arena.tryAllocate(baseBytes);
+            if (!allocation)
+                filterScratch = mapScratch(layout.bytes - filteredOffset);
+        }
+        if (allocation != cudaOutOfMemory)
+            driver.check(allocation, "CUDA synthesis scratch allocation");
+        const auto base = allocation == cudaOutOfMemory ? mapScratch(layout.bytes) : arena.address;
+        if (!filterScratch)
+            filterScratch = base + filteredOffset;
         recordPeak();
         const auto upload = [&](size_t offset, const auto& items) {
-            auto address = arena.address + offset;
+            auto address = base + offset;
             if (!items.empty())
-                driver.check(driver.put(address, items.data(), items.size() * sizeof(items.front())), "CUDA batch upload");
+                uploadScratch(address, items.data(), items.size() * sizeof(items.front()), "CUDA batch upload");
             return address;
         };
         auto voices = upload(voiceOffset, index.voices), tiles = upload(tileOffset, index.tiles);
         auto indices = upload(indexOffset, index.indices), controls = upload(controlOffset, index.controls);
         auto modulation = upload(modulationOffset, index.modulation), jobData = upload(jobOffset, jobs);
         auto filterTiles = upload(filterTileOffset, index.filterTiles), filterHeads = upload(filterHeadOffset, index.filterHeads);
-        auto filtered = arena.address + filteredOffset, phase = arena.address + phaseOffset;
-        auto mix = arena.address + mixOffset, resultData = arena.address + resultOffset;
-        auto mono = natural ? arena.address + monoOffset : mix;
+        auto filtered = filterScratch;
+        auto phase = filtered + phaseOffset - filteredOffset;
+        auto mix = base + mixOffset, resultData = base + resultOffset;
+        auto mono = natural ? base + monoOffset : mix;
         // After mono conversion the float mix is dead, so its allocation also holds the compact PCM.
         auto packed = mix;
         auto assessment = upload(audioOffset, audioJobs), starts = upload(onsetOffset, onsets);
@@ -642,7 +817,7 @@ struct Renderer::Impl {
         launchChunks(kernel, int(index.tiles.size()), threads, samples.address, sinc.address, voices, tiles,
             indices, controls, modulation, filtered, mix);
         if (natural) {
-            auto stats = arena.address + statsOffset, windowStats = arena.address + windowOffset;
+            auto stats = base + statsOffset, windowStats = base + windowOffset;
             launchChunks(stereoScan, blocks, 128, jobData, count, mix, stats);
             void* nativeArgs[] = {&jobData, &count, &mix, &stats, &resultData};
             driver.check(driver.launch(nativeEnd, (count + 31) / 32, 1, 1, 32, 1, 1, 0,
@@ -656,7 +831,7 @@ struct Renderer::Impl {
         driver.check(driver.launch(pcmLayout, 1, 1, 1, 1, 1, 1, 0, nullptr, layoutArgs, nullptr), "CUDA PCM layout launch");
         launchChunks(pcmFinalize, blocks, 128, jobData, count, mono, packed, resultData);
         if (assess) {
-            auto bodyPower = arena.address + bodyPowerOffset, onsetPower = arena.address + onsetPowerOffset;
+            auto bodyPower = base + bodyPowerOffset, onsetPower = base + onsetPowerOffset;
             launchChunks(bodyMeasure, bodyBlocks, 128, assessment, count, packed, resultData, bodyPower, audio);
             if (audio.enabled)
                 launchChunks(onsetMeasure, int(onsets.size()), 160, assessment, count, starts, packed,
@@ -668,8 +843,8 @@ struct Renderer::Impl {
         synthesis.jobData = jobData;
         synthesis.resultData = resultData;
         synthesis.source = packed;
-        synthesis.output = natural ? mono : arena.address + stereoOutput;
-        synthesis.pcmJobs = arena.address + pcmJobOffset;
+        synthesis.output = natural ? mono : base + stereoOutput;
+        synthesis.pcmJobs = base + pcmJobOffset;
         synthesis.blocks = blocks;
         return synthesis;
     }
@@ -693,8 +868,7 @@ struct Renderer::Impl {
     std::vector<TailResult> readResults(const Synthesis& work)
     {
         std::vector<TailResult> results(work.jobs.size());
-        driver.check(driver.get(results.data(), work.resultData, results.size() * sizeof(TailResult)),
-            "CUDA render metadata download");
+        downloadScratch(results.data(), work.resultData, results.size() * sizeof(TailResult), "CUDA render metadata download");
         return results;
     }
 
@@ -716,6 +890,7 @@ struct Renderer::Impl {
         auto results = readResults(work);
         const auto count = packedSamples(results);
         auto samples = receivePcm(pcm, count);
+        releaseMappedScratch();
         downloaded += count * sizeof(int16_t);
         return {std::move(samples), std::move(results), timing(begin, end)};
     }
@@ -742,7 +917,7 @@ struct Renderer::Impl {
     {
         pack(work);
         const auto resultBytes = work.jobs.size() * sizeof(TailResult);
-        driver.check(driver.copy(destination, work.resultData, resultBytes), "CUDA retain group metadata");
+        copyScratch(destination, work.resultData, resultBytes, "CUDA retain group metadata");
         end.record();
         TailResult last{};
         driver.check(driver.get(&last, destination + resultBytes - sizeof(last), sizeof(last)), "CUDA retained PCM size");
@@ -760,7 +935,7 @@ struct Renderer::Impl {
                     waiting += bytes;
                     peakWaiting = std::max(peakWaiting, waiting);
                     recordPeak();
-                    driver.check(driver.copy(device->address, work.output, bytes), "CUDA retain group PCM");
+                    copyScratch(device->address, work.output, bytes, "CUDA retain group PCM");
                     chunk.device = std::move(device);
                 }
             }
@@ -769,6 +944,7 @@ struct Renderer::Impl {
                 spilled += bytes;
             }
         }
+        releaseMappedScratch();
         return chunk;
     }
 
@@ -787,8 +963,7 @@ struct Renderer::Impl {
             next = first + work.jobs.size();
             const auto destination = resultData + (first - group.first) * sizeof(TailResult);
             if (next == size_t(group.end)) {
-                driver.check(driver.copy(destination, work.resultData, work.jobs.size() * sizeof(TailResult)),
-                    "CUDA complete group metadata");
+                copyScratch(destination, work.resultData, work.jobs.size() * sizeof(TailResult), "CUDA complete group metadata");
                 work.resultData = destination;
                 match(groupData, 1, group.first, resultData);
                 pack(work);
@@ -809,15 +984,18 @@ struct Renderer::Impl {
             const auto pcmOffset = layout.section(chunk.jobs.size() * sizeof(PcmJob));
             const auto sourceOffset = layout.section(chunk.host ? chunk.bytes : 0);
             const auto outputOffset = layout.section(chunk.bytes);
-            arena.allocate(layout.bytes);
+            const auto allocation = arena.tryAllocate(layout.bytes);
+            if (allocation != cudaOutOfMemory)
+                driver.check(allocation, "CUDA retained group scratch allocation");
+            const auto base = allocation == cudaOutOfMemory ? mapScratch(layout.bytes) : arena.address;
             recordPeak();
-            Synthesis work{std::move(chunk.jobs), arena.address + jobOffset,
+            Synthesis work{std::move(chunk.jobs), base + jobOffset,
                 resultData + (chunk.first - group.first) * sizeof(TailResult),
-                chunk.device ? chunk.device->address : arena.address + sourceOffset, arena.address + outputOffset,
-                arena.address + pcmOffset, chunk.blocks};
-            driver.check(driver.put(work.jobData, work.jobs.data(), jobBytes), "CUDA retained job upload");
+                chunk.device ? chunk.device->address : base + sourceOffset, base + outputOffset,
+                base + pcmOffset, chunk.blocks};
+            uploadScratch(work.jobData, work.jobs.data(), jobBytes, "CUDA retained job upload");
             if (chunk.host)
-                driver.check(driver.put(work.source, chunk.host.get(), chunk.bytes), "CUDA spilled PCM upload");
+                uploadScratch(work.source, chunk.host.get(), chunk.bytes, "CUDA spilled PCM upload");
             TimingEvent begin(driver), end(driver);
             begin.record();
             pack(work);

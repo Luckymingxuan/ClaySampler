@@ -15,9 +15,11 @@ Job manifests can combine presets and explicitly named relationship groups. The 
 
 ## Device behavior
 
-NVRTC targets the selected GPU's architecture when supported by the installed compiler. For a newer GPU it emits PTX for the latest available compatible target. NVRTC 12.4 and newer use four compiler optimization threads when the host has at least four hardware threads. Launch sizing uses the CUDA occupancy API. Batches use a budget based on total and available VRAM. The decoded sample bank stays on the device across repeated passes. The CLI reports peak explicit CUDA allocations and CUDA event timing separately from end-to-end timing.
+NVRTC targets the selected GPU's architecture when supported by the installed compiler. For a newer GPU it emits PTX for the latest available compatible target. NVRTC 12.4 and newer use four compiler optimization threads when the host has at least four hardware threads. The per-user kernel cache keys compiled code by source, compiler version and target flags so separate invocations can reuse it. If the cached module cannot load, the renderer compiles it again. Launch sizing uses the CUDA occupancy API.
 
-One process uses one CUDA device. Job manifests share the sample bank across presets, deduplicating identical sample paths. When the cache reaches a device-derived threshold, the CPU starts a fresh decoded bank at the next planning boundary while the GPU finishes the previous work with the old bank. The active window's sample bank and synthesis scratch must fit in VRAM. The group PCM fallback applies to finished tracks waiting for partners.
+The CPU adds free VRAM and reusable device scratch to estimate available memory. It uses the smaller of half that amount and one eighth of total VRAM as the batch budget. A job above that budget runs alone and attempts its exact scratch allocation. If allocation runs out of VRAM, the renderer halves the batch size and retries. For a single job, it first tries to move filter and pitch scratch to CUDA-mapped host memory while keeping the mix on the device. It can map the entire scratch buffer when needed, using the same synthesis and finishing kernels. Peak explicit device allocations and CUDA event timing are reported separately from end-to-end timing.
+
+One process uses one CUDA device. Job manifests share the device sample bank across presets, deduplicating identical sample paths. When the cache reaches a device-derived threshold, the CPU starts a fresh decoded bank at the next planning boundary while the GPU finishes the previous work with the old bank. The decoded sample bank stays on the device across repeated passes. Group PCM staging applies separately to finished tracks waiting for partners.
 
 ## Upstream references
 

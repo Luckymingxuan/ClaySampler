@@ -94,6 +94,20 @@ A separate run submitted the same 48 jobs to ClayEngine's `render_planned` using
 
 Both renderers rejected the same three jobs and wrote the same 45 job outputs. The batch comparison checked acceptance and output counts. The byte-for-byte comparison above used the same synthesis output to validate post-processing.
 
+## Dynamic CUDA batches and kernel cache
+
+On an RTX 4080 Laptop GPU, ClaySampler v0.1.0 and the updated renderer each processed the same 768 GigaMIDI and VSCO2 jobs in twelve fresh 64-job invocations per round. The order was baseline, updated with an empty kernel cache, updated with a populated cache, then baseline again. Each round produced 652 byte-identical accepted WAVs and identical rejection reasons.
+
+| Metric | v0.1.0 | Updated |
+| --- | ---: | ---: |
+| Mean round wall time | 17.06 s | 10.25 s |
+| Mean GPU utilization | 32.9% | 46.8% |
+| GPU utilization samples at or below 20% | 54.8% | 20.0% |
+
+The wall times include process startup, rendering, quality checks and WAV writes. They exclude ClayEngine's upstream selection and replacement work. Accepted WAV throughput increased by 66.4%, and wall time fell by 39.9%. Device-wide utilization was sampled with `nvidia-smi` at 200 ms intervals. CUDA event time was about 2.94–2.98 seconds per round across both versions. The main measured gain was shorter initialization, whose per-batch median fell from about 0.87 seconds to 0.16–0.18 seconds.
+
+A separate 24-job synthetic mix of small and medium renders fell from 0.96 to 0.66 seconds per pass at the median over five passes, with byte-identical WAVs. A three-job case with one oversized render failed at the v0.1.0 scratch budget check and produced all three WAVs with dynamic batching. A temporary build with injected CUDA allocation failures exercised batch splitting and both mapped-host scratch paths. Independent and volume-matched WAVs matched the device-only outputs byte for byte. Cache corruption recovery, unavailable-cache compilation, and the tail and group audio regressions passed.
+
 ## Preset audit
 
 The audit uses the host-only ClaySampler loader and the sfizz C API on the same paths. It records accepted region counts, ClaySampler rejection reasons and unknown opcodes reported by sfizz. The result measures loading and sample resolution. Use the audio comparison harness for MIDI-specific behavior and sound.
