@@ -122,6 +122,10 @@ Two isolated changes were compared against the renderer from the preceding secti
 
 The combined source built successfully. Windows application control denied execution of the combined binary (WinError 4551). The timings above describe the isolated changes. Combined performance and allocation-failure regression checks remain pending.
 
+## Configurable batch job limits
+
+The grouped audio regression renders a 66-job volume group with the default limits and with `--cpu-batch-jobs 1 --gpu-batch-jobs 128`. The latter completes the group in one CUDA batch without retaining or staging PCM between batches. The accepted WAVs match the default limits byte for byte.
+
 ## Preset audit
 
 The audit uses the host-only ClaySampler loader and the sfizz C API on the same paths. It records accepted region counts, ClaySampler rejection reasons and unknown opcodes reported by sfizz. The result measures loading and sample resolution. Use the audio comparison harness for MIDI-specific behavior and sound.

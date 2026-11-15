@@ -54,6 +54,7 @@ struct Options {
     Path sndfile = setting("CLAY_SNDFILE", "libsndfile.so.1");
 #endif
     int device = 0, rate = 44100, passes = 1;
+    size_t cpuBatchJobs = 64, gpuBatchJobs = 64;
     clay::TailPolicy tail = clay::TailPolicy::natural;
     std::optional<double> tailMax, maxAudio;
     std::optional<int> tailFadeMs;
@@ -113,6 +114,8 @@ Options arguments(int argc, Char** argv)
         else if (name == "--device") options.device = integer(value, 0, 1024);
         else if (name == "--samplerate") options.rate = integer(value, 8000, 192000);
         else if (name == "--passes") options.passes = integer(value, 1, 1000);
+        else if (name == "--cpu-batch-jobs") options.cpuBatchJobs = integer(value, 1, std::numeric_limits<int>::max());
+        else if (name == "--gpu-batch-jobs") options.gpuBatchJobs = integer(value, 1, std::numeric_limits<int>::max());
         else if (name == "--tail-policy") options.tail = tailPolicy(value);
         else if (name == "--tail-max-seconds") options.tailMax = number(value, 0, 3600);
         else if (name == "--tail-fade-ms") options.tailFadeMs = integer(value, 0, 3600000);
@@ -290,7 +293,7 @@ PlannedBatch planBatch(const Options& options, const std::vector<Task>& tasks,
     batch.freshSamples = freshSamples;
     if (freshSamples)
         bank.releaseDecoded();
-    const auto count = std::min(size_t{64}, tasks.size() - first);
+    const auto count = std::min(options.cpuBatchJobs, tasks.size() - first);
     batch.plans.reserve(count);
     batch.outputs->reserve(count);
     size_t frames = 0;
@@ -425,7 +428,8 @@ int run(const Options& options)
     const auto unlimited = std::numeric_limits<size_t>::max();
     auto opening = prefetch(0, manifest ? 512 * size_t{1024} * 1024 : unlimited, false);
     clay::Renderer renderer(options.device, options.nvrtc, natural, audio,
-        options.groupVolume ? options.groupMinimum.value_or(2) : 0, size_t(options.waitingMiB.value_or(256)) * 1024 * 1024);
+        options.groupVolume ? options.groupMinimum.value_or(2) : 0,
+        size_t(options.waitingMiB.value_or(256)) * 1024 * 1024, options.gpuBatchJobs);
     auto startup = opening.get();
     const auto sampleBudget = manifest ? renderer.sampleCacheBudget() : unlimited;
     const auto rotateSamples = [&] { return manifest && bank.pcm.size() >= sampleBudget / sizeof(float); };
@@ -497,6 +501,7 @@ int main(int argc, char** argv)
             std::cout << "Usage: claysampler --sfz preset.sfz --output directory [options] file.mid ...\n"
                          "       claysampler --jobs tasks.tsv [options]\n"
                          "Options: --samplerate Hz --device index --passes count --nvrtc path --sndfile path\n"
+                         "         --cpu-batch-jobs count --gpu-batch-jobs count (default 64 each)\n"
                          "         --tail-policy natural|orig|custom (default natural)\n"
                          "         --max-audio-seconds seconds (natural)\n"
                          "         --tail-max-seconds seconds [--tail-fade-ms milliseconds] (custom)\n"

@@ -476,14 +476,14 @@ struct Renderer::Impl {
     TailConfig tail;
     AudioConfig audio;
     int groupMinimum;
-    size_t waitingLimit;
+    size_t waitingLimit, batchJobs;
     size_t uploaded{}, cacheBudget{}, peak{}, waiting{}, peakWaiting{}, spilled{}, downloaded{};
 
-    Impl(int ordinal, const Path& rtc, bool useNatural, AudioConfig config, int minimum, size_t limit)
+    Impl(int ordinal, const Path& rtc, bool useNatural, AudioConfig config, int minimum, size_t limit, size_t jobs)
         : natural(useNatural), tail{config.window, 2 * config.rate,
             int(std::nearbyint(config.rate / 4.)), int(std::nearbyint(config.rate / 10.)), std::pow(10., -1.5),
             32768 * std::pow(10., -3.9), 32768 * std::pow(10., -3.)},
-          audio(config), groupMinimum(minimum), waitingLimit(limit)
+          audio(config), groupMinimum(minimum), waitingLimit(limit), batchJobs(jobs)
     {
         driver.check(driver.init(0), "CUDA initialization");
         int device{};
@@ -739,7 +739,7 @@ struct Renderer::Impl {
     Synthesis synthesize(const std::vector<RenderPlan>& plans, size_t first, size_t stop, const TimingEvent& begin,
                          const std::vector<size_t>& sizes = {})
     {
-        size_t maxJobs = 64;
+        size_t maxJobs = batchJobs;
         for (;;) {
             auto work = trySynthesize(plans, first, stop, begin, sizes, maxJobs);
             if (!work.jobs.empty())
@@ -1131,8 +1131,8 @@ struct Renderer::Impl {
 };
 
 Renderer::Renderer(int device, const Path& nvrtc, bool natural, AudioConfig audio, int groupMinimum,
-                   size_t waitingLimit)
-    : impl_(std::make_unique<Impl>(device, nvrtc, natural, audio, groupMinimum, waitingLimit))
+                   size_t waitingLimit, size_t batchJobs)
+    : impl_(std::make_unique<Impl>(device, nvrtc, natural, audio, groupMinimum, waitingLimit, batchJobs))
 {
 }
 

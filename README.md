@@ -31,6 +31,15 @@ During batch rendering, the CPU plans the next group and writes completed WAVs w
 
 The renderer sizes CUDA batches from estimated scratch use and current VRAM availability. A job above the normal batch budget runs alone. If a scratch allocation runs out of VRAM, the renderer retries with fewer jobs and can back a single job's scratch with CUDA-mapped host memory.
 
+The caller chooses how many jobs to submit per invocation. Within an invocation, callers can set the two job-count limits independently. Both accept positive integers and default to 64.
+
+- `--cpu-batch-jobs` sets the job limit for a CPU planning window. Frame and sample budgets can end a window sooner. An explicit volume group can exceed the limit so its members stay together in the planner.
+- `--gpu-batch-jobs` caps the jobs in one CUDA batch. Available VRAM can reduce the actual job count.
+
+```sh
+claysampler --jobs tasks.tsv --cpu-batch-jobs 256 --gpu-batch-jobs 128
+```
+
 To check whether a preset loads and its sample headers resolve, run `claysampler --check-sfz preset.sfz`. The load check runs without a CUDA device or MIDI input. Place `--sndfile path` before the preset paths when an explicit decoder library is needed.
 
 ## Tail policies
