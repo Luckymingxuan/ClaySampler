@@ -60,9 +60,14 @@ AudioBank::~AudioBank() { delete decoder_; }
 
 int AudioBank::describe(const std::filesystem::path& path)
 {
-    const auto key = std::filesystem::weakly_canonical(path);
-    if (const auto it = decoder_->loaded.find(key); it != decoder_->loaded.end())
+    auto& loaded = decoder_->loaded;
+    if (const auto it = loaded.find(path); it != loaded.end())
         return it->second;
+    const auto key = std::filesystem::weakly_canonical(path);
+    if (const auto it = loaded.find(key); it != loaded.end()) {
+        loaded.emplace(path, it->second);
+        return it->second;
+    }
     SoundInfo info;
     std::unique_ptr<void, int(*)(void*)> file(decoder_->open(key.c_str(), readMode, &info), decoder_->close);
     if (!file || info.frames <= 0 || info.frames > std::numeric_limits<int>::max() ||
@@ -82,7 +87,9 @@ int AudioBank::describe(const std::filesystem::path& path)
     const auto id = static_cast<int>(samples.size());
     samples.push_back({UINT64_MAX, static_cast<int>(info.frames), info.rate, info.channels, loopFirst, loopEnd});
     decoder_->paths.push_back(key);
-    decoder_->loaded.emplace(key, id);
+    loaded.emplace(key, id);
+    if (path != key)
+        loaded.emplace(path, id);
     return id;
 }
 

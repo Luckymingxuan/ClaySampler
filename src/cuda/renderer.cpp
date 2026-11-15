@@ -375,9 +375,9 @@ struct BatchIndex {
     std::vector<ControlPoint> controls;
     std::vector<VoiceModulation> modulation;
     std::vector<FilterTile> filterTiles;
-    std::vector<int> filterHeads;
+    std::vector<int> filterHeads, pitchHeads;
     size_t frames = 0;
-    size_t filteredFrames = 0;
+    size_t filteredSamples = 0;
     size_t pitchFrames = 0;
 
     void append(const RenderPlan& plan, int tileFrames)
@@ -426,14 +426,19 @@ struct BatchIndex {
             voice.firstModulation += modulationOffset;
             if (voice.filterTrack >= 0) {
                 auto& tail = tails[voice.filterTrack];
-                if (tail < 0)
-                    filterHeads.push_back(index);
-                else
+                if (tail < 0) {
+                    if (voice.variablePitch)
+                        pitchHeads.push_back(index);
+                    if (std::any_of(std::begin(voice.filters), std::end(voice.filters),
+                        [](const auto& filter) { return filter.type != FilterType::none; }))
+                        filterHeads.push_back(index);
+                } else {
                     voices[tail].nextFilteredSpan = index;
+                }
                 tail = index;
                 voice.nextFilteredSpan = -1;
-                voice.filteredOffset = filteredFrames;
-                filteredFrames += voice.end - voice.begin;
+                voice.filteredOffset = filteredSamples;
+                filteredSamples += size_t(voice.end - voice.begin) * voice.channels;
                 if (voice.variablePitch) {
                     voice.phaseOffset = pitchFrames;
                     pitchFrames += voice.end - voice.begin;
@@ -459,14 +464,14 @@ struct Renderer::Impl {
         ~Context() { if (address) driver.destroy(address); }
     } context{driver};
     Buffer samples{driver}, sinc{driver}, arena{driver}, groupControl{driver};
-    HostPcm mappedScratch{driver};
-    DevicePtr mappedBase{};
+    HostPcm mappedScratch{driver}, mappedSamples{driver};
+    DevicePtr mappedBase{}, sampleData{};
     std::vector<std::shared_ptr<HostPcm>> hostPcm;
     Handle module{}, kernel{}, filterSource{}, filterPass{}, pitchPass{};
     Handle stereoScan{}, nativeEnd{}, monoQuantize{}, trimEnd{}, pcmLayout{}, pcmFinalize{};
     Handle bodyMeasure{}, onsetMeasure{}, audioSummary{}, volumeMatch{}, acceptedLayout{}, acceptedPack{};
     std::string deviceName;
-    int threads{};
+    int threads{}, multiprocessors{};
     bool natural;
     TailConfig tail;
     AudioConfig audio;
@@ -489,6 +494,7 @@ struct Renderer::Impl {
         int major{}, minor{};
         driver.check(driver.attribute(&major, 75, device), "CUDA architecture major");
         driver.check(driver.attribute(&minor, 76, device), "CUDA architecture minor");
+        driver.check(driver.attribute(&multiprocessors, 16, device), "CUDA multiprocessor count");
         constexpr unsigned mapHost = 8; // CU_CTX_MAP_HOST
         driver.check(driver.create(&context.address, mapHost, device), "CUDA context");
         loadKernels(driver, module, rtc, 10 * major + minor, natural, audio.enabled, groupMinimum > 0);
@@ -533,12 +539,14 @@ struct Renderer::Impl {
     {
         if (fresh) {
             samples.reset();
+            mappedSamples.reset();
+            sampleData = 0;
             uploaded = 0;
         }
         const auto bytes = bank.pcm.size() * sizeof(float);
-        if (bytes <= uploaded && samples.address)
+        if (bytes <= uploaded && sampleData)
             return;
-        if (bytes > samples.capacity || !samples.address) {
+        if (!mappedSamples.address && (bytes > samples.capacity || !samples.address)) {
             size_t free{}, total{};
             driver.check(driver.memory(&free, &total), "CUDA free memory");
             const size_t slack = std::min(bytes / 2, size_t{128} * 1024 * 1024);
@@ -555,23 +563,43 @@ struct Renderer::Impl {
                 std::swap(samples.capacity, replacement.capacity);
             } else {
                 arena.reset();
-                samples.allocate(bytes);
+                const auto status = samples.tryAllocate(bytes);
+                if (status != cudaOutOfMemory)
+                    driver.check(status, "CUDA sample bank allocation");
                 uploaded = 0;
             }
         }
-        if (bytes > uploaded)
-            driver.check(driver.put(samples.address + uploaded, bank.pcm.data() + uploaded / sizeof(float),
-                bytes - uploaded), "CUDA sample upload");
+        if (!samples.address && bytes > mappedSamples.capacity) {
+            mappedSamples.reset();
+            sampleData = mapHost(mappedSamples, bytes, "CUDA mapped sample bank");
+            uploaded = 0;
+        }
+        if (bytes > uploaded) {
+            const auto* source = bank.pcm.data() + uploaded / sizeof(float);
+            if (mappedSamples.address)
+                std::memcpy(static_cast<char*>(mappedSamples.address) + uploaded, source, bytes - uploaded);
+            else
+                driver.check(driver.put(samples.address + uploaded, source, bytes - uploaded), "CUDA sample upload");
+        }
+        if (samples.address)
+            sampleData = samples.address;
         uploaded = bytes;
         recordPeak();
     }
 
-    DevicePtr mapScratch(size_t bytes)
+    DevicePtr mapHost(HostPcm& buffer, size_t bytes, const char* operation)
     {
         constexpr unsigned deviceMap = 2; // CU_MEMHOSTALLOC_DEVICEMAP
-        driver.check(driver.allocMapped(&mappedScratch.address, bytes, deviceMap), "CUDA mapped scratch allocation");
-        driver.check(driver.mappedAddress(&mappedBase, mappedScratch.address, 0), "CUDA mapped scratch address");
-        mappedScratch.capacity = bytes;
+        driver.check(driver.allocMapped(&buffer.address, bytes, deviceMap), operation);
+        DevicePtr address{};
+        driver.check(driver.mappedAddress(&address, buffer.address, 0), operation);
+        buffer.capacity = bytes;
+        return address;
+    }
+
+    DevicePtr mapScratch(size_t bytes)
+    {
+        mappedBase = mapHost(mappedScratch, bytes, "CUDA mapped scratch allocation");
         return mappedBase;
     }
 
@@ -647,6 +675,20 @@ struct Renderer::Impl {
         }
     }
 
+    void launchRecurrences(Handle function, int count, DevicePtr voices, DevicePtr heads,
+                           DevicePtr controls, DevicePtr modulation, DevicePtr scratch)
+    {
+        if (!count)
+            return;
+        // Each lane advances an independent serial recurrence. Spread small sets
+        // across SMs, then fill warps as the number of independent tracks grows.
+        const int blocks = 2 * multiprocessors;
+        const int width = std::clamp(1 + (count - 1) / blocks, 1, 32);
+        void* args[] = {&voices, &heads, &controls, &modulation, &scratch, &count};
+        driver.check(driver.launch(function, 1 + (count - 1) / width, 1, 1,
+            width, 1, 1, 0, nullptr, args, nullptr), "CUDA voice recurrence launch");
+    }
+
     struct Synthesis {
         std::vector<TailJob> jobs;
         DevicePtr jobData{}, resultData{}, source{}, output{}, pcmJobs{};
@@ -667,33 +709,46 @@ struct Renderer::Impl {
         const auto tiles = blocksFor(plan.frames, threads);
         size_t bytes = size_t(plan.frames) * frameBytes + tiles * sizeof(Tile) + plan.spans.size() * sizeof(VoiceSpan);
         bytes += sizeof(TailJob) + sizeof(TailResult) + 256;
+        size_t finishing = 0, filtering = 0;
         if (natural)
-            bytes += size_t(plan.frames) * sizeof(int16_t) + blocksFor(plan.frames, tailBlockFrames) * sizeof(StereoStats) +
+            finishing += size_t(plan.frames) * sizeof(int16_t) + blocksFor(plan.frames, tailBlockFrames) * sizeof(StereoStats) +
                 blocksFor(plan.frames, tail.window) * sizeof(MonoStats);
         if (audio.enabled || groupMinimum) {
             const int body = audio.enabled || plan.volumeGroup ? plan.bodyFrames : 0;
-            bytes += sizeof(AudioJob) + sizeof(PcmJob) + size_t(bodyWindows(body)) * sizeof(unsigned long long);
-            bytes += plan.onsets.size() * (sizeof(int) + sizeof(unsigned long long));
+            bytes += sizeof(AudioJob) + plan.onsets.size() * sizeof(int);
+            finishing += sizeof(PcmJob) + (size_t(bodyWindows(body)) + plan.onsets.size()) * sizeof(unsigned long long);
             if (!natural)
-                bytes += size_t(plan.frames) * frameBytes;
+                finishing += size_t(plan.frames) * frameBytes;
         }
         for (const auto& span : plan.spans) {
             bytes += size_t((span.end - 1) / threads - span.begin / threads + 1) * sizeof(int);
             if (span.filterTrack >= 0) {
                 const size_t duration = span.end - span.begin;
-                bytes += duration * 2 * sizeof(float) + blocksFor(duration, threads) * sizeof(FilterTile);
+                filtering += duration * span.channels * sizeof(float);
+                bytes += blocksFor(duration, threads) * sizeof(FilterTile);
                 if (span.variablePitch)
-                    bytes += duration * sizeof(double);
+                    filtering += duration * sizeof(double);
             }
         }
-        bytes += plan.filterTracks * sizeof(int);
+        bytes += plan.filterTracks * 2 * sizeof(int);
         for (const auto& track : plan.controls)
             bytes += track.size() * sizeof(ControlPoint);
-        return bytes + plan.modulation.size() * sizeof(VoiceModulation);
+        return bytes + plan.modulation.size() * sizeof(VoiceModulation) + std::max(finishing, filtering);
     }
 
     Synthesis synthesize(const std::vector<RenderPlan>& plans, size_t first, size_t stop, const TimingEvent& begin,
-                         const std::vector<size_t>& sizes = {}, size_t maxJobs = 64)
+                         const std::vector<size_t>& sizes = {})
+    {
+        size_t maxJobs = 64;
+        for (;;) {
+            auto work = trySynthesize(plans, first, stop, begin, sizes, maxJobs);
+            if (!work.jobs.empty())
+                return work;
+        }
+    }
+
+    Synthesis trySynthesize(const std::vector<RenderPlan>& plans, size_t first, size_t stop, const TimingEvent& begin,
+                            const std::vector<size_t>& sizes, size_t& maxJobs)
     {
         const auto frameBytes = 2 * (natural ? sizeof(float) : sizeof(int16_t));
         size_t free{}, total{};
@@ -701,7 +756,7 @@ struct Renderer::Impl {
         const auto available = free + arena.capacity;
         // Keep routine batches bounded by both the device size and current memory pressure.
         // A large job gets its own batch and tries the exact arena allocation below.
-        const auto budget = std::min(available / 2, total / 8);
+        const auto budget = std::min(available - available / 4, total / 4);
         size_t estimated = 0;
         BatchIndex index;
         Synthesis synthesis;
@@ -748,38 +803,45 @@ struct Renderer::Impl {
         const auto voiceOffset = reserve(index.voices), tileOffset = reserve(index.tiles), indexOffset = reserve(index.indices);
         const auto controlOffset = reserve(index.controls), modulationOffset = reserve(index.modulation);
         const auto filterTileOffset = reserve(index.filterTiles), filterHeadOffset = reserve(index.filterHeads);
+        const auto pitchHeadOffset = reserve(index.pitchHeads);
+        const auto jobOffset = reserve(jobs), audioOffset = reserve(audioJobs), onsetOffset = reserve(onsets);
         const auto mixOffset = layout.section(index.frames * frameBytes);
-        const auto jobOffset = reserve(jobs), resultOffset = layout.section(count * sizeof(TailResult));
-        const auto monoBytes = natural ? index.frames * sizeof(int16_t) : 0;
-        const auto monoOffset = layout.section(monoBytes);
-        const auto statsOffset = layout.section(natural ? blocks * sizeof(StereoStats) : 0);
-        const auto windowOffset = layout.section(windows * sizeof(MonoStats));
-        const auto audioOffset = reserve(audioJobs), onsetOffset = reserve(onsets);
-        const auto bodyPowerOffset = layout.section(size_t(bodyBlocks) * sizeof(unsigned long long));
-        const auto onsetPowerOffset = layout.section(onsets.size() * sizeof(unsigned long long));
-        const auto pcmJobOffset = layout.section(assess ? jobs.size() * sizeof(PcmJob) : 0);
-        const auto stereoOutput = layout.section(assess && !natural ? index.frames * frameBytes : 0);
-        const auto baseBytes = layout.bytes;
-        const auto filteredBytes = index.filteredFrames * 2 * sizeof(float);
-        const auto phaseBytes = index.pitchFrames * sizeof(double);
-        const auto filteredOffset = layout.section(filteredBytes);
-        const auto phaseOffset = layout.section(phaseBytes);
-        auto allocation = arena.tryAllocate(layout.bytes);
-        if (allocation == cudaOutOfMemory && jobs.size() > 1)
-            return synthesize(plans, first, stop, begin, sizes, jobs.size() / 2);
+        const auto resultOffset = layout.section(count * sizeof(TailResult));
+        // Once the mix kernel finishes, PCM and quality buffers can reuse filter and pitch scratch.
+        const auto scratchOffset = layout.section(0);
+        ArenaLayout finishing;
+        const auto monoOffset = finishing.section(natural ? index.frames * sizeof(int16_t) : 0);
+        const auto statsOffset = finishing.section(natural ? blocks * sizeof(StereoStats) : 0);
+        const auto windowOffset = finishing.section(windows * sizeof(MonoStats));
+        const auto bodyPowerOffset = finishing.section(size_t(bodyBlocks) * sizeof(unsigned long long));
+        const auto onsetPowerOffset = finishing.section(onsets.size() * sizeof(unsigned long long));
+        const auto pcmJobOffset = finishing.section(assess ? jobs.size() * sizeof(PcmJob) : 0);
+        const auto stereoOutput = finishing.section(assess && !natural ? index.frames * frameBytes : 0);
+        ArenaLayout filtering;
+        const auto filteredBytes = index.filteredSamples * sizeof(float);
+        filtering.section(filteredBytes);
+        const auto phaseOffset = filtering.section(index.pitchFrames * sizeof(double));
+        const auto bytes = scratchOffset + std::max(finishing.bytes, filtering.bytes);
+        auto allocation = arena.tryAllocate(bytes);
+        if (allocation == cudaOutOfMemory && jobs.size() > 1) {
+            // Destroy the failed batch's host metadata before assembling a smaller one.
+            maxJobs = jobs.size() / 2;
+            return {};
+        }
         DevicePtr filterScratch{};
-        if (allocation == cudaOutOfMemory && filteredBytes) {
+        if (allocation == cudaOutOfMemory && filtering.bytes > finishing.bytes) {
             // Filter and pitch scratch account for most of a dense job's memory.
             // Kernels can access it directly in host memory while the mix stays on the device.
-            allocation = arena.tryAllocate(baseBytes);
+            allocation = arena.tryAllocate(scratchOffset + finishing.bytes);
             if (!allocation)
-                filterScratch = mapScratch(layout.bytes - filteredOffset);
+                filterScratch = mapScratch(filtering.bytes);
         }
         if (allocation != cudaOutOfMemory)
             driver.check(allocation, "CUDA synthesis scratch allocation");
-        const auto base = allocation == cudaOutOfMemory ? mapScratch(layout.bytes) : arena.address;
+        const auto base = allocation == cudaOutOfMemory ? mapScratch(bytes) : arena.address;
+        const auto finishScratch = base + scratchOffset;
         if (!filterScratch)
-            filterScratch = base + filteredOffset;
+            filterScratch = finishScratch;
         recordPeak();
         const auto upload = [&](size_t offset, const auto& items) {
             auto address = base + offset;
@@ -791,33 +853,25 @@ struct Renderer::Impl {
         auto indices = upload(indexOffset, index.indices), controls = upload(controlOffset, index.controls);
         auto modulation = upload(modulationOffset, index.modulation), jobData = upload(jobOffset, jobs);
         auto filterTiles = upload(filterTileOffset, index.filterTiles), filterHeads = upload(filterHeadOffset, index.filterHeads);
+        auto pitchHeads = upload(pitchHeadOffset, index.pitchHeads);
         auto filtered = filterScratch;
-        auto phase = filtered + phaseOffset - filteredOffset;
+        auto phase = filtered + phaseOffset;
         auto mix = base + mixOffset, resultData = base + resultOffset;
-        auto mono = natural ? base + monoOffset : mix;
+        auto mono = natural ? finishScratch + monoOffset : mix;
         // After mono conversion the float mix is dead, so its allocation also holds the compact PCM.
         auto packed = mix;
         auto assessment = upload(audioOffset, audioJobs), starts = upload(onsetOffset, onsets);
         begin.record();
-        if (index.filteredFrames) {
-            int heads = static_cast<int>(index.filterHeads.size());
-            constexpr int filterThreads = 64;
-            const auto voiceBlocks = (heads + filterThreads - 1) / filterThreads;
-            if (index.pitchFrames) {
-                void* args[] = {&voices, &filterHeads, &controls, &modulation, &phase, &heads};
-                driver.check(driver.launch(pitchPass, voiceBlocks, 1, 1, filterThreads, 1, 1, 0,
-                    nullptr, args, nullptr), "CUDA variable pitch launch");
-            }
-            launchChunks(filterSource, int(index.filterTiles.size()), threads, samples.address, sinc.address,
+        if (index.filteredSamples) {
+            launchRecurrences(pitchPass, int(index.pitchHeads.size()), voices, pitchHeads, controls, modulation, phase);
+            launchChunks(filterSource, int(index.filterTiles.size()), threads, sampleData, sinc.address,
                 voices, filterTiles, controls, modulation, phase, filtered);
-            void* args[] = {&voices, &filterHeads, &controls, &modulation, &filtered, &heads};
-            driver.check(driver.launch(filterPass, voiceBlocks, 1, 1,
-                filterThreads, 1, 1, 0, nullptr, args, nullptr), "CUDA filter launch");
+            launchRecurrences(filterPass, int(index.filterHeads.size()), voices, filterHeads, controls, modulation, filtered);
         }
-        launchChunks(kernel, int(index.tiles.size()), threads, samples.address, sinc.address, voices, tiles,
+        launchChunks(kernel, int(index.tiles.size()), threads, sampleData, sinc.address, voices, tiles,
             indices, controls, modulation, filtered, mix);
         if (natural) {
-            auto stats = base + statsOffset, windowStats = base + windowOffset;
+            auto stats = finishScratch + statsOffset, windowStats = finishScratch + windowOffset;
             launchChunks(stereoScan, blocks, 128, jobData, count, mix, stats);
             void* nativeArgs[] = {&jobData, &count, &mix, &stats, &resultData};
             driver.check(driver.launch(nativeEnd, (count + 31) / 32, 1, 1, 32, 1, 1, 0,
@@ -831,7 +885,7 @@ struct Renderer::Impl {
         driver.check(driver.launch(pcmLayout, 1, 1, 1, 1, 1, 1, 0, nullptr, layoutArgs, nullptr), "CUDA PCM layout launch");
         launchChunks(pcmFinalize, blocks, 128, jobData, count, mono, packed, resultData);
         if (assess) {
-            auto bodyPower = base + bodyPowerOffset, onsetPower = base + onsetPowerOffset;
+            auto bodyPower = finishScratch + bodyPowerOffset, onsetPower = finishScratch + onsetPowerOffset;
             launchChunks(bodyMeasure, bodyBlocks, 128, assessment, count, packed, resultData, bodyPower, audio);
             if (audio.enabled)
                 launchChunks(onsetMeasure, int(onsets.size()), 160, assessment, count, starts, packed,
@@ -843,8 +897,8 @@ struct Renderer::Impl {
         synthesis.jobData = jobData;
         synthesis.resultData = resultData;
         synthesis.source = packed;
-        synthesis.output = natural ? mono : base + stereoOutput;
-        synthesis.pcmJobs = base + pcmJobOffset;
+        synthesis.output = natural ? mono : finishScratch + stereoOutput;
+        synthesis.pcmJobs = finishScratch + pcmJobOffset;
         synthesis.blocks = blocks;
         return synthesis;
     }
@@ -1041,7 +1095,13 @@ struct Renderer::Impl {
         ArenaLayout control;
         const auto groupOffset = control.section(groups.size() * sizeof(AudioGroup));
         const auto resultOffset = control.section(largest * sizeof(TailResult));
-        groupControl.allocate(control.bytes);
+        const auto allocation = groupControl.tryAllocate(control.bytes);
+        if (allocation == cudaOutOfMemory) {
+            arena.reset();
+            groupControl.allocate(control.bytes);
+        } else {
+            driver.check(allocation, "CUDA group control allocation");
+        }
         recordPeak();
         const auto groupData = groupControl.address + groupOffset;
         const auto resultData = groupControl.address + resultOffset;

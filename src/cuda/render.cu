@@ -194,7 +194,7 @@ __device__ float jobGain(const ControlPoint* controls, const int* offsets, int f
 
 extern "C" __global__ void renderFilterSources(const float* samples, const float* sinc, const VoiceSpan* voices,
     const FilterTile* tiles, const ControlPoint* controls, const VoiceModulation* modulation,
-    const double* phase, float2* filtered, int firstTile)
+    const double* phase, float* filtered, int firstTile)
 {
     const auto tile = tiles[firstTile + blockIdx.x];
     const auto& voice = voices[tile.span];
@@ -206,7 +206,10 @@ extern "C" __global__ void renderFilterSources(const float* samples, const float
     auto sample = voiceAudio(samples, sinc, voice, controls, modulation,
         controlAt(controls, offsets[2], offsets[3], frame), frame, true, position);
     const auto gain = jobGain(controls, offsets, frame);
-    filtered[voice.filteredOffset + frame - voice.begin] = make_float2(sample.x * gain, sample.y * gain);
+    auto* destination = filtered + voice.filteredOffset + (frame - voice.begin) * voice.channels;
+    destination[0] = sample.x * gain;
+    if (voice.channels == 2)
+        destination[1] = sample.y * gain;
 }
 
 extern "C" __global__ void prepareVoicePitch(const VoiceSpan* voices, const int* heads,
@@ -313,7 +316,7 @@ __device__ float filterSample(float x, const Coefficients& c, float& z1, float& 
 }
 
 extern "C" __global__ void applyVoiceFilters(const VoiceSpan* voices, const int* heads,
-    const ControlPoint* controls, const VoiceModulation* modulation, float2* filtered, int count)
+    const ControlPoint* controls, const VoiceModulation* modulation, float* filtered, int count)
 {
     const auto track = int(blockIdx.x * blockDim.x + threadIdx.x);
     if (track >= count)
@@ -330,8 +333,13 @@ extern "C" __global__ void applyVoiceFilters(const VoiceSpan* voices, const int*
         const auto rate = voice.sampleRate;
         const auto amount = 1 - expf(-1000.f / rate);
         int count[voiceFilterSlots];
-        for (int f = 0; f < voiceFilterSlots; ++f)
+        int sectionCount = 0, firstSlot = 0;
+        for (int f = 0; f < voiceFilterSlots; ++f) {
             count[f] = sections(voice.filters[f].type);
+            if (count[f])
+                firstSlot = f;
+            sectionCount += count[f];
+        }
         bool moving = voice.activeEnvelope[0] != 0;
         for (int j = voice.firstModulation; j < voice.firstModulation + voice.modulationCount; ++j) {
             auto target = modulation[j].target;
@@ -370,22 +378,43 @@ extern "C" __global__ void applyVoiceFilters(const VoiceSpan* voices, const int*
                 }
                 initialized = true;
             }
-            auto& sample = filtered[voice.filteredOffset + frame - voice.begin];
-            auto value = sample;
+            auto* sample = filtered + voice.filteredOffset + (frame - voice.begin) * voice.channels;
+            if (!moving && sectionCount == 1) {
+                const auto coeff = current[firstSlot];
+                auto first = z1[firstSlot][0], second = z2[firstSlot][0];
+                // Keep the recurrence in registers for a static single-section filter.
+                if (voice.channels == 1) {
+                    for (int i = frame; i < voice.end; ++i, ++sample)
+                        *sample = filterSample(*sample, coeff, first.x, second.x);
+                } else {
+                    for (int i = frame; i < voice.end; ++i, sample += 2) {
+                        sample[0] = filterSample(sample[0], coeff, first.x, second.x);
+                        sample[1] = filterSample(sample[1], coeff, first.y, second.y);
+                    }
+                }
+                z1[firstSlot][0] = first;
+                z2[firstSlot][0] = second;
+                break;
+            }
+            auto left = sample[0];
+            auto right = voice.channels == 2 ? sample[1] : 0.f;
             for (int f = 0; f < voiceFilterSlots; ++f) {
                 for (int section = 0; section < count[f]; ++section) {
-                    value.x = filterSample(value.x, current[f], z1[f][section].x, z2[f][section].x);
-                    value.y = filterSample(value.y, current[f], z1[f][section].y, z2[f][section].y);
+                    left = filterSample(left, current[f], z1[f][section].x, z2[f][section].x);
+                    if (voice.channels == 2)
+                        right = filterSample(right, current[f], z1[f][section].y, z2[f][section].y);
                 }
             }
-            sample = value;
+            sample[0] = left;
+            if (voice.channels == 2)
+                sample[1] = right;
         }
     }
 }
 
 __device__ float2 mixFrame(const float* samples, const float* sinc, const VoiceSpan* voices,
                           const Tile& tile, const int* indices, const ControlPoint* controls,
-                          const VoiceModulation* modulation, const float2* filtered, int frame)
+                          const VoiceModulation* modulation, const float* filtered, int frame)
 {
     const auto pan = controlAt(controls, tile.controls[2], tile.controls[3], frame);
     float left = 0, right = 0, wetLeft = 0, wetRight = 0;
@@ -394,7 +423,8 @@ __device__ float2 mixFrame(const float* samples, const float* sinc, const VoiceS
         if (frame < voice.begin || frame >= voice.end)
             continue;
         if (voice.filterTrack >= 0) {
-            auto sample = filtered[voice.filteredOffset + frame - voice.begin];
+            const auto* source = filtered + voice.filteredOffset + (frame - voice.begin) * voice.channels;
+            auto sample = make_float2(source[0], voice.channels == 1 ? source[0] : source[1]);
             if (voice.channels == 1) {
                 auto offset = pan;
                 for (int j = voice.firstModulation; j < voice.firstModulation + voice.modulationCount; ++j) {
@@ -426,7 +456,7 @@ using OutputFrame = short2;
 
 extern "C" __global__ void renderTiles(const float* samples, const float* sinc, const VoiceSpan* voices,
                                       const Tile* tiles, const int* indices, const ControlPoint* controls,
-                                      const VoiceModulation* modulation, const float2* filtered,
+                                      const VoiceModulation* modulation, const float* filtered,
                                       OutputFrame* output, int firstTile)
 {
     const Tile tile = tiles[firstTile + blockIdx.x];
