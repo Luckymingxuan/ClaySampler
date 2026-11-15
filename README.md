@@ -23,9 +23,22 @@ claysampler --sfz instrument.sfz --output renders take1.mid take2.mid
 
 Use `--nvrtc` and `--sndfile` for explicit library paths, or set `CLAY_NVRTC` and `CLAY_SNDFILE`. The Windows defaults are `nvrtc64_120_0.dll` and `libsndfile-1.dll`. On Linux they are `libnvrtc.so` and `libsndfile.so.1`. Use `--device` for a different CUDA ordinal and `--samplerate` to change the default of 44,100 Hz.
 
+ClaySampler reuses compiled CUDA kernels across invocations. The per-user cache lives in `%LOCALAPPDATA%/ClaySampler/kernels` on Windows and `${XDG_CACHE_HOME:-$HOME/.cache}/claysampler/kernels` on Linux. A missing or unavailable cache triggers normal compilation.
+
 Successful jobs print `OK` and write PCM16 WAVs. Rejected MIDI jobs print `REJECT` with the input and reason. A batch containing rejected jobs returns exit status 2. A fatal setup error returns exit status 1.
 
 During batch rendering, the CPU plans the next group and writes completed WAVs while the GPU renders and finishes the current group. In `natural` mode, the GPU sends the finished mono PCM16 samples and output metadata to the host for WAV writing.
+
+The renderer sizes CUDA batches from estimated scratch use and current VRAM availability. A job above the normal batch budget runs alone. If a scratch allocation runs out of VRAM, the renderer retries with fewer jobs and can back a single job's scratch with CUDA-mapped host memory.
+
+The caller chooses how many jobs to submit per invocation. Within an invocation, callers can set the two job-count limits independently. Both accept positive integers and default to 64.
+
+- `--cpu-batch-jobs` sets the job limit for a CPU planning window. Frame and sample budgets can end a window sooner. An explicit volume group can exceed the limit so its members stay together in the planner.
+- `--gpu-batch-jobs` caps the jobs in one CUDA batch. Available VRAM can reduce the actual job count.
+
+```sh
+claysampler --jobs tasks.tsv --cpu-batch-jobs 256 --gpu-batch-jobs 128
+```
 
 To check whether a preset loads and its sample headers resolve, run `claysampler --check-sfz preset.sfz`. The load check runs without a CUDA device or MIDI input. Place `--sndfile path` before the preset paths when an explicit decoder library is needed.
 

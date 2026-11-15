@@ -119,14 +119,18 @@ def check(options, root):
     flags = ("--group-volume", "mean", "--quality-gate", "clayengine")
     device = render("device", large, *flags, expected=2)
     host = render("host", large, *flags, "--group-wait-mib", "0", expected=2)
+    wide = render("wide", large, *flags, "--cpu-batch-jobs", "1", "--gpu-batch-jobs", "128", expected=2)
     device_bytes, device_spill, device_wait = transfer(device)
     host_bytes, host_spill, host_wait = transfer(host)
     assert device_bytes == host_bytes > device_wait > 0
     assert (device_spill, host_wait, host_spill) == (0, 0, device_wait)
+    assert transfer(wide) == (device_bytes, 0, 0)
     assert device.stdout.index("solo.wav") < device.stdout.index("out-0.wav")
     for _, _, _, output in large:
         if output != "quiet":
-            assert (root / f"device/{output}.wav").read_bytes() == (root / f"host/{output}.wav").read_bytes()
+            expected = (root / f"device/{output}.wav").read_bytes()
+            assert (root / f"host/{output}.wav").read_bytes() == expected
+            assert (root / f"wide/{output}.wav").read_bytes() == expected
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ struct RenderBatch {
 class Renderer {
 public:
     Renderer(int device, const std::filesystem::path& nvrtc, bool natural, AudioConfig audio, int groupMinimum,
-             size_t waitingLimit);
+             size_t waitingLimit, size_t batchJobs);
     ~Renderer();
     void uploadSamples(const AudioBank& bank, bool fresh);
     void renderWindow(const std::vector<RenderPlan>& plans, const std::function<void(RenderBatch, size_t)>& publish);
