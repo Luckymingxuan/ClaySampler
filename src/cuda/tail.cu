@@ -51,10 +51,9 @@ __device__ short fadeSample(short value, int index, int count)
 }
 
 #if CLAY_FLOAT_OUTPUT
-extern "C" __global__ void scanStereo(const TailJob* jobs, int count, const float2* mix,
-                                     StereoStats* stats, int firstBlock)
+__device__ void finishScanStereo(const TailJob* jobs, int count, const float2* mix,
+                                     StereoStats* stats, int block)
 {
-    const int block = firstBlock + blockIdx.x;
     const auto job = jobs[tailJobFor<&TailJob::blockFirst>(jobs, count, block)];
     const int first = (block - job.blockFirst) * tailBlockFrames;
     const int end = min(first + tailBlockFrames, job.frames);
@@ -75,10 +74,15 @@ extern "C" __global__ void scanStereo(const TailJob* jobs, int count, const floa
         stats[block] = {power, peak};
 }
 
-extern "C" __global__ void selectNative(const TailJob* jobs, int count, const float2* mix,
-                                       const StereoStats* stats, TailResult* results)
+extern "C" __global__ void scanStereo(const TailJob* jobs, int count, const float2* mix,
+                                     StereoStats* stats, int firstBlock)
 {
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    finishScanStereo(jobs, count, mix, stats, int(firstBlock + blockIdx.x));
+}
+
+__device__ void finishSelectNative(const TailJob* jobs, int count, const float2* mix,
+                                       const StereoStats* stats, TailResult* results, int index)
+{
     if (index >= count)
         return;
     const auto job = jobs[index];
@@ -134,11 +138,16 @@ extern "C" __global__ void selectNative(const TailJob* jobs, int count, const fl
     results[index] = result;
 }
 
-extern "C" __global__ void quantizeMono(const TailJob* jobs, int count, const float2* mix,
-                                       const TailResult* results, short* mono, MonoStats* stats,
-                                       int window, int firstBlock)
+extern "C" __global__ void selectNative(const TailJob* jobs, int count, const float2* mix,
+                                       const StereoStats* stats, TailResult* results)
 {
-    const int block = firstBlock + blockIdx.x;
+    finishSelectNative(jobs, count, mix, stats, results, int(blockIdx.x * blockDim.x + threadIdx.x));
+}
+
+__device__ void finishQuantizeMono(const TailJob* jobs, int count, const float2* mix,
+                                       const TailResult* results, short* mono, MonoStats* stats,
+                                       int window, int block)
+{
     const int index = tailJobFor<&TailJob::windowFirst>(jobs, count, block);
     const auto job = jobs[index];
     const auto result = results[index];
@@ -164,10 +173,16 @@ extern "C" __global__ void quantizeMono(const TailJob* jobs, int count, const fl
         stats[block] = {power, peak};
 }
 
-extern "C" __global__ void selectTrim(const TailJob* jobs, int count, const MonoStats* stats,
-                                     TailResult* results, TailConfig config)
+extern "C" __global__ void quantizeMono(const TailJob* jobs, int count, const float2* mix,
+                                       const TailResult* results, short* mono, MonoStats* stats,
+                                       int window, int firstBlock)
 {
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    finishQuantizeMono(jobs, count, mix, results, mono, stats, window, int(firstBlock + blockIdx.x));
+}
+
+__device__ void finishSelectTrim(const TailJob* jobs, int count, const MonoStats* stats,
+                                     TailResult* results, TailConfig config, int index)
+{
     if (index >= count || results[index].status != TailStatus::ok)
         return;
     auto& result = results[index];
@@ -190,9 +205,15 @@ extern "C" __global__ void selectTrim(const TailJob* jobs, int count, const Mono
         }
     }
 }
+
+extern "C" __global__ void selectTrim(const TailJob* jobs, int count, const MonoStats* stats,
+                                     TailResult* results, TailConfig config)
+{
+    finishSelectTrim(jobs, count, stats, results, config, int(blockIdx.x * blockDim.x + threadIdx.x));
+}
 #endif
 
-extern "C" __global__ void layoutPcm(const TailJob* jobs, int count, TailResult* results)
+__device__ void finishLayoutPcm(const TailJob* jobs, int count, TailResult* results)
 {
     unsigned long long offset = 0;
     for (int i = 0; i < count; ++i) {
@@ -211,10 +232,14 @@ extern "C" __global__ void layoutPcm(const TailJob* jobs, int count, TailResult*
     }
 }
 
-extern "C" __global__ void finalizePcm(const TailJob* jobs, int count, const short* input,
-                                      short* output, TailResult* results, int firstBlock)
+extern "C" __global__ void layoutPcm(const TailJob* jobs, int count, TailResult* results)
 {
-    const int block = firstBlock + blockIdx.x;
+    finishLayoutPcm(jobs, count, results);
+}
+
+__device__ void finishFinalizePcm(const TailJob* jobs, int count, const short* input,
+                                      short* output, TailResult* results, int block)
+{
     const int index = tailJobFor<&TailJob::blockFirst>(jobs, count, block);
     const auto job = jobs[index];
     const auto outputOffset = results[index].offset;
@@ -237,7 +262,7 @@ extern "C" __global__ void finalizePcm(const TailJob* jobs, int count, const sho
             auto value = input[source];
             if (frame >= fadeStart)
                 value = fadeSample(value, frame - fadeStart, fade);
-            if (CLAY_FLOAT_OUTPUT || frame >= fadeStart)
+            if (CLAY_FLOAT_OUTPUT || input != output || frame >= fadeStart)
                 output[(outputOffset + frame) * channels + channel] = value;
             framePeak = max(framePeak, abs(int(value)));
 #if CLAY_AUDIO_QA
@@ -263,4 +288,10 @@ extern "C" __global__ void finalizePcm(const TailJob* jobs, int count, const sho
         atomicMin(&results[index].first, audibleFirst);
         atomicMax(&results[index].last, audibleLast);
     }
+}
+
+extern "C" __global__ void finalizePcm(const TailJob* jobs, int count, const short* input,
+                                      short* output, TailResult* results, int firstBlock)
+{
+    finishFinalizePcm(jobs, count, input, output, results, int(firstBlock + blockIdx.x));
 }

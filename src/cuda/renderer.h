@@ -13,6 +13,8 @@ struct RenderBatch {
     std::shared_ptr<int16_t> pcm;
     std::vector<TailResult> results;
     double kernelSeconds = 0;
+    size_t failedScratchBytes = 0; // Single rejected job at the published index.
+    std::vector<size_t> jobIndices{}; // Noncontiguous completions from the rolling queue.
 };
 
 class Renderer {
@@ -21,7 +23,9 @@ public:
              size_t waitingLimit, size_t batchJobs);
     ~Renderer();
     void uploadSamples(const AudioBank& bank, bool fresh);
-    void renderWindow(const std::vector<RenderPlan>& plans, const std::function<void(RenderBatch, size_t)>& publish);
+    using Refill = std::function<bool(std::vector<RenderPlan>&, bool wait)>;
+    void renderWindow(std::vector<RenderPlan>& plans, const std::function<void(RenderBatch, size_t)>& publish,
+                      const Refill& refill = {});
     const std::string& device() const;
     size_t peakBytes() const;
     size_t sampleCacheBudget() const;

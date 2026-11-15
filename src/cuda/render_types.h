@@ -15,6 +15,18 @@ enum class FilterType { none, low1, high1, low2, high2, band2, notch2, low4, hig
 enum class Generator { none, sine, silence, noise };
 constexpr int voiceFilterSlots = 5;
 
+struct FilterCoefficients {
+    float b0, b1, b2, a1, a2;
+};
+
+struct VoiceState {
+    double position, step;
+    int pitchSpan, previousLoopEnd, previousLoopStart;
+    bool pitchInitialized, filterInitialized;
+    float z1[voiceFilterSlots][3][2], z2[voiceFilterSlots][3][2];
+    FilterCoefficients coefficients[voiceFilterSlots];
+};
+
 struct VoiceFilter {
     FilterType type;
     float cutoff, resonance, bandwidth, gain;
@@ -92,7 +104,7 @@ struct TailConfig {
 
 enum class TailStatus {
     ok, duration, nonfinite, peak, audioDuration, quietPerformance, excessiveSilence,
-    silentAudio, clipping, silentBody, incompleteGroup
+    silentAudio, clipping, silentBody, incompleteGroup, scratchMemory
 };
 
 struct AudioConfig {
@@ -129,3 +141,35 @@ struct TailResult {
 
 struct StereoStats { double power; float peak; };
 struct MonoStats { double power; int peak; };
+
+// Device pointers and cumulative launch ranges for one independently advancing job.
+struct ScheduledJob {
+    const VoiceSpan* voices;
+    const Tile* tiles;
+    const FilterTile* sourceTiles;
+    const int *indices, *pitchHeads, *filterHeads;
+    const ControlPoint* controls;
+    const VoiceModulation* modulation;
+    VoiceState* states;
+    float* filtered;
+    double* phase;
+    void* mix;
+    int first, end, tileFirst, sourceFirst;
+    int tileEnd, sourceEnd, pitchEnd, filterEnd;
+};
+
+struct FinishJob {
+    const TailJob* job;
+    const AudioJob* audio;
+    const int* onsets;
+    const void* mix;
+    short *mono, *packed, *output;
+    StereoStats* stereo;
+    MonoStats* windows;
+    unsigned long long *bodyPower, *onsetPower;
+    TailResult* result;
+    PcmJob* pcm;
+    int blocks, windowsEnd, bodyEnd, onsetEnd;
+    TailResult* summary;
+    unsigned long long outputOffset;
+};

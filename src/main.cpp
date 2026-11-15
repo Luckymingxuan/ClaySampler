@@ -275,7 +275,7 @@ int checkPresets(int argc, Char** argv)
 
 struct PlannedBatch {
     std::vector<clay::RenderPlan> plans;
-    std::shared_ptr<std::vector<Path>> outputs = std::make_shared<std::vector<Path>>();
+    std::shared_ptr<std::vector<const Task*>> jobs = std::make_shared<std::vector<const Task*>>();
     std::vector<std::string> rejected;
     size_t next = 0;
     double seconds = 0;
@@ -295,7 +295,7 @@ PlannedBatch planBatch(const Options& options, const std::vector<Task>& tasks,
         bank.releaseDecoded();
     const auto count = std::min(options.cpuBatchJobs, tasks.size() - first);
     batch.plans.reserve(count);
-    batch.outputs->reserve(count);
+    batch.jobs->reserve(count);
     size_t frames = 0;
     batch.next = first;
     Path parsedPath;
@@ -335,7 +335,7 @@ PlannedBatch planBatch(const Options& options, const std::vector<Task>& tasks,
             plan.bodyFrames = midi.bodyFrames;
             if (options.quality != "off")
                 plan.onsets = midi.onsets;
-            batch.outputs->push_back(task.output);
+            batch.jobs->push_back(&task);
             frames += plan.frames;
             batch.plans.push_back(std::move(plan));
         } catch (const std::exception& error) {
@@ -360,6 +360,7 @@ const char* tailError(TailStatus status)
     case TailStatus::clipping: return "excessive_audio_clipping";
     case TailStatus::silentBody: return "silent_melody_body";
     case TailStatus::incompleteGroup: return "insufficient_qualified_group_members";
+    case TailStatus::scratchMemory: return "CUDA mapped scratch allocation: out of memory";
     case TailStatus::ok: return nullptr;
     }
     return "unknown CUDA tail status";
@@ -370,14 +371,14 @@ struct WrittenBatch {
     std::string ok, rejected;
 };
 
-WrittenBatch writeBatch(const clay::RenderBatch& batch, const std::vector<Path>& outputs, size_t first,
+WrittenBatch writeBatch(const clay::RenderBatch& batch, const std::vector<const Task*>& jobs, size_t first,
                         int rate, int channels, bool manifest)
 {
     std::ostringstream ok, rejected;
     size_t passed = 0;
     for (size_t i = 0; i < batch.results.size(); ++i) {
         const auto& result = batch.results[i];
-        const auto& path = outputs[first + i];
+        const auto& path = jobs[first + i]->output;
         const auto& stats = result.audio;
         const auto* failure = tailError(result.status);
         if (stats.measured) {
@@ -464,15 +465,54 @@ int run(const Options& options)
             // Only the planner can grow the host bank, and the CUDA thread already uploaded this group's samples.
             if (group.next < tasks.size())
                 next = prefetch(group.next, sampleBudget, rotateSamples());
+            std::optional<PlannedBatch> deferred;
+            clay::Renderer::Refill refill;
+            if (next.valid() && options.gpuBatchJobs > 1) {
+                refill = [&](std::vector<clay::RenderPlan>& plans, bool wait) {
+                    for (;;) {
+                        if (!next.valid() || (!wait && next.wait_for(std::chrono::seconds(0)) != std::future_status::ready))
+                            return false;
+                        auto ready = next.get();
+                        if (ready.freshSamples) {
+                            deferred = std::move(ready);
+                            return false;
+                        }
+                        for (const auto& line : ready.rejected) std::cerr << line;
+                        const auto uploadStart = Clock::now();
+                        renderer.uploadSamples(bank, false);
+                        preparation += ready.seconds + elapsed(uploadStart);
+                        group.jobs->insert(group.jobs->end(), ready.jobs->begin(), ready.jobs->end());
+                        for (auto& plan : ready.plans) plans.push_back(std::move(plan));
+                        if (ready.next < tasks.size())
+                            next = prefetch(ready.next, sampleBudget, rotateSamples());
+                        if (!ready.plans.empty()) return true;
+                    }
+                };
+            }
             renderer.renderWindow(group.plans, [&](clay::RenderBatch batch, size_t first) {
+                kernelSeconds += batch.kernelSeconds;
+                if (batch.failedScratchBytes) {
+                    const auto& job = *(*group.jobs)[first];
+                    std::cerr << "REJECT\t" << job.output.u8string() << '\t' << tailError(TailStatus::scratchMemory)
+                              << " (bytes=" << batch.failedScratchBytes << ")\tMIDI=" << job.midi.u8string()
+                              << "\tSFZ=" << job.sfz.u8string() << '\n';
+                    return;
+                }
                 if (writers.size() >= 3)
                     drain();
-                kernelSeconds += batch.kernelSeconds;
+                std::vector<const Task*> jobs;
+                jobs.reserve(batch.results.size());
+                for (size_t i = 0; i < batch.results.size(); ++i)
+                    jobs.push_back((*group.jobs)[batch.jobIndices.empty() ? first + i : batch.jobIndices[i]]);
                 writers.push_back(std::async(std::launch::async,
-                    [batch = std::move(batch), outputs = group.outputs, first, rate = options.rate, channels, manifest] {
-                        return writeBatch(batch, *outputs, first, rate, channels, manifest);
+                    [batch = std::move(batch), jobs = std::move(jobs), rate = options.rate, channels, manifest] {
+                        return writeBatch(batch, jobs, 0, rate, channels, manifest);
                     }));
-            });
+            }, refill);
+            if (deferred) {
+                group = std::move(*deferred);
+                continue;
+            }
             if (!next.valid())
                 break;
             group = next.get();
