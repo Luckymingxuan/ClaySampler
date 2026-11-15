@@ -27,14 +27,16 @@ ClaySampler reuses compiled CUDA kernels across invocations. The per-user cache 
 
 Successful jobs print `OK` and write PCM16 WAVs. Rejected jobs print `REJECT` with the input or output and reason. If a job exhausts CUDA-mapped host scratch after allocation retries, its rejection also includes the MIDI, SFZ, and requested bytes; remaining jobs continue. A batch containing only job-level failures returns exit status 2. Fatal setup or runtime errors return exit status 1.
 
-During batch rendering, the CPU plans the next group and writes completed WAVs while the GPU renders and finishes the current group. In `natural` mode, the GPU sends the finished mono PCM16 samples and output metadata to the host for WAV writing.
+During rendering, the CPU prepares upcoming jobs and writes completed WAVs while the GPU works. Stateful synthesis can admit jobs from the next ready CPU planning window at segment boundaries, without another ClayEngine request. A sample-bank reset drains active jobs before switching banks. In `natural` mode, the GPU sends the finished mono PCM16 samples and output metadata to the host for WAV writing.
 
-The renderer sizes CUDA batches from estimated scratch use and current VRAM availability. A job above the normal batch budget runs alone. If a scratch allocation runs out of VRAM, the renderer retries with fewer jobs and can back a single job's scratch with CUDA-mapped host memory.
+The renderer bounds active jobs and reusable synthesis scratch by available VRAM. Each resident job keeps its own playback and filter state. Completed jobs free their synthesis storage for queued jobs; volume-group members retain accepted PCM until matching. Segment sizing preserves parallel work across notes and shortens intervals when scratch requires it. Starting windows without recurrence work retain the batched fast path. Allocation recovery retries smaller workloads and can back a single job's scratch with CUDA-mapped host memory.
 
 The caller chooses how many jobs to submit per invocation. Within an invocation, callers can set the two job-count limits independently. Both accept positive integers and default to 64.
 
+Refill stays within the submitted manifest. For example, ClayEngine can submit 256 jobs and ClaySampler can keep up to 32 resident, admitting queued jobs at segment boundaries. ClayEngine still waits for all 256 jobs to succeed or be rejected before submitting its next batch. ClaySampler does not currently accept new external jobs while an invocation is running.
+
 - `--cpu-batch-jobs` sets the job limit for a CPU planning window. Frame and sample budgets can end a window sooner. An explicit volume group can exceed the limit so its members stay together in the planner.
-- `--gpu-batch-jobs` caps the jobs in one CUDA batch. Available VRAM can reduce the actual job count.
+- `--gpu-batch-jobs` caps resident jobs in the rolling queue, or jobs in one CUDA batch on the fast path. Available VRAM can reduce the actual job count.
 
 ```sh
 claysampler --jobs tasks.tsv --cpu-batch-jobs 256 --gpu-batch-jobs 128

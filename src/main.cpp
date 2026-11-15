@@ -465,6 +465,30 @@ int run(const Options& options)
             // Only the planner can grow the host bank, and the CUDA thread already uploaded this group's samples.
             if (group.next < tasks.size())
                 next = prefetch(group.next, sampleBudget, rotateSamples());
+            std::optional<PlannedBatch> deferred;
+            clay::Renderer::Refill refill;
+            if (next.valid() && options.gpuBatchJobs > 1) {
+                refill = [&](std::vector<clay::RenderPlan>& plans, bool wait) {
+                    for (;;) {
+                        if (!next.valid() || (!wait && next.wait_for(std::chrono::seconds(0)) != std::future_status::ready))
+                            return false;
+                        auto ready = next.get();
+                        if (ready.freshSamples) {
+                            deferred = std::move(ready);
+                            return false;
+                        }
+                        for (const auto& line : ready.rejected) std::cerr << line;
+                        const auto uploadStart = Clock::now();
+                        renderer.uploadSamples(bank, false);
+                        preparation += ready.seconds + elapsed(uploadStart);
+                        group.jobs->insert(group.jobs->end(), ready.jobs->begin(), ready.jobs->end());
+                        for (auto& plan : ready.plans) plans.push_back(std::move(plan));
+                        if (ready.next < tasks.size())
+                            next = prefetch(ready.next, sampleBudget, rotateSamples());
+                        if (!ready.plans.empty()) return true;
+                    }
+                };
+            }
             renderer.renderWindow(group.plans, [&](clay::RenderBatch batch, size_t first) {
                 kernelSeconds += batch.kernelSeconds;
                 if (batch.failedScratchBytes) {
@@ -476,11 +500,19 @@ int run(const Options& options)
                 }
                 if (writers.size() >= 3)
                     drain();
+                std::vector<const Task*> jobs;
+                jobs.reserve(batch.results.size());
+                for (size_t i = 0; i < batch.results.size(); ++i)
+                    jobs.push_back((*group.jobs)[batch.jobIndices.empty() ? first + i : batch.jobIndices[i]]);
                 writers.push_back(std::async(std::launch::async,
-                    [batch = std::move(batch), jobs = group.jobs, first, rate = options.rate, channels, manifest] {
-                        return writeBatch(batch, *jobs, first, rate, channels, manifest);
+                    [batch = std::move(batch), jobs = std::move(jobs), rate = options.rate, channels, manifest] {
+                        return writeBatch(batch, jobs, 0, rate, channels, manifest);
                     }));
-            });
+            }, refill);
+            if (deferred) {
+                group = std::move(*deferred);
+                continue;
+            }
             if (!next.valid())
                 break;
             group = next.get();

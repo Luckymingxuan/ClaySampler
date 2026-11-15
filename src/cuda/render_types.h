@@ -141,3 +141,35 @@ struct TailResult {
 
 struct StereoStats { double power; float peak; };
 struct MonoStats { double power; int peak; };
+
+// Device pointers and cumulative launch ranges for one independently advancing job.
+struct ScheduledJob {
+    const VoiceSpan* voices;
+    const Tile* tiles;
+    const FilterTile* sourceTiles;
+    const int *indices, *pitchHeads, *filterHeads;
+    const ControlPoint* controls;
+    const VoiceModulation* modulation;
+    VoiceState* states;
+    float* filtered;
+    double* phase;
+    void* mix;
+    int first, end, tileFirst, sourceFirst;
+    int tileEnd, sourceEnd, pitchEnd, filterEnd;
+};
+
+struct FinishJob {
+    const TailJob* job;
+    const AudioJob* audio;
+    const int* onsets;
+    const void* mix;
+    short *mono, *packed, *output;
+    StereoStats* stereo;
+    MonoStats* windows;
+    unsigned long long *bodyPower, *onsetPower;
+    TailResult* result;
+    PcmJob* pcm;
+    int blocks, windowsEnd, bodyEnd, onsetEnd;
+    TailResult* summary;
+    unsigned long long outputOffset;
+};

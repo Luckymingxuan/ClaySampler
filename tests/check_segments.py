@@ -1,6 +1,7 @@
 """Compare segmented synthesis with a baseline across filter and pitch boundaries."""
 
 import argparse
+import itertools
 import math
 import struct
 import subprocess
@@ -25,27 +26,34 @@ def check(options, root):
         "00 b0 40 7f 00 90 3c 64 87 40 b0 01 40 87 40 e0 00 50 "
         "87 40 80 3c 00 87 40 b0 40 00 00 ff 2f 00"))
     midi(root / "short.mid", bytes.fromhex("00 90 3c 64 60 80 3c 00 00 ff 2f 00"))
-    for tail in ("natural", "orig"):
+    for tail, grouped in itertools.product(("natural", "orig"), (False, True)):
         outputs = []
         for name, executable, cap in (("baseline", options.baseline, 32), ("segmented", options.clay, 32),
-                                      ("single", options.clay, 1)):
-            output = root / f"{name}-{tail}"
-            manifest = root / f"{name}-{tail}.tsv"
+                                      ("single", options.clay, 1), ("rolling", options.clay, 2),
+                                      ("prefetch", options.clay, 2)):
+            output = root / f"{name}-{tail}-{grouped}"
+            manifest = root / f"{name}-{tail}-{grouped}.tsv"
             manifest.write_text("".join(
-                f"-\tvoice.sfz\t{source}.mid\t{output.name}/{i}.wav\n"
+                f"{'pair' if grouped else '-'}\tvoice.sfz\t{source}.mid\t{output.name}/{i}.wav\n"
                 for i, source in enumerate(("short", "long", "short", "long"))), encoding="utf-8")
             command = [executable.resolve(), "--jobs", manifest, "--tail-policy", tail,
                        "--gpu-batch-jobs", str(cap), "--quality-gate", "off"]
+            if grouped:
+                command += ["--group-volume", "mean"]
+            if name == "prefetch":
+                command += ["--cpu-batch-jobs", "1"]
             for key in ("nvrtc", "sndfile"):
                 value = getattr(options, key)
                 if value:
                     command += [f"--{key}", value.resolve()]
             result = subprocess.run(command, capture_output=True, text=True)
             assert result.returncode == 0, result.stdout + result.stderr
-            if options.require_segments and name != "baseline":
+            if name == "rolling":
+                assert "SCHEDULE\t" in result.stderr and "refills=0" not in result.stderr, result.stderr
+            if options.require_segments and name in ("segmented", "single"):
                 assert "SEGMENT\t" in result.stderr, "The test did not exercise multiple segments"
             outputs.append([(output / f"{i}.wav").read_bytes() for i in range(4)])
-        assert outputs[0] == outputs[1] == outputs[2], f"Segment boundary mismatch in {tail}"
+        assert all(output == outputs[0] for output in outputs[1:]), f"Segment boundary mismatch in {tail}"
 
 
 if __name__ == "__main__":

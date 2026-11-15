@@ -132,6 +132,22 @@ def check(options, root):
             assert (root / f"host/{output}.wav").read_bytes() == expected
             assert (root / f"wide/{output}.wav").read_bytes() == expected
 
+    # Filter state activates rolling admission, including a group with a rejected member.
+    for name in ("soft", "loud", "quiet"):
+        (root / f"{name}-filtered.sfz").write_text(
+            (root / f"{name}.sfz").read_text() + "cutoff=1800 resonance=1\n", encoding="ascii")
+    filtered = [(group, preset + "-filtered", source, output) for group, preset, source, output in rows]
+    reference = render("filtered-reference", filtered, *flags, "--gpu-batch-jobs", "128", expected=2)
+    rolling = render("filtered-rolling", filtered, *flags, "--cpu-batch-jobs", "1", "--gpu-batch-jobs", "2", expected=2)
+    spilled = render("filtered-spilled", filtered, *flags, "--cpu-batch-jobs", "1", "--gpu-batch-jobs", "2",
+                     "--group-wait-mib", "0", expected=2)
+    assert "SCHEDULE\t" in rolling.stderr and "quiet_performance" in rolling.stderr
+    for output in ("soft", "loud", "independent"):
+        expected = (root / f"filtered-reference/{output}.wav").read_bytes()
+        assert (root / f"filtered-rolling/{output}.wav").read_bytes() == expected
+        assert (root / f"filtered-spilled/{output}.wav").read_bytes() == expected
+    assert not (root / "filtered-rolling/quiet.wav").exists()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)

@@ -125,6 +125,12 @@ public:
         return 0;
     }
 
+    void swap(Buffer& other)
+    {
+        std::swap(address, other.address);
+        std::swap(capacity, other.capacity);
+    }
+
     void reset()
     {
         if (address)
@@ -469,6 +475,8 @@ struct Renderer::Impl {
     DevicePtr mappedBase{}, sampleData{};
     std::vector<std::shared_ptr<HostPcm>> hostPcm;
     Handle module{}, kernel{}, filterSource{}, filterPass{}, pitchPass{};
+    Handle scheduledMix{}, scheduledSource{}, scheduledPitch{}, scheduledFilter{}, scheduledFinish{}, scheduledPackLayout{};
+    size_t residentBytes{};
     Handle stereoScan{}, nativeEnd{}, monoQuantize{}, trimEnd{}, pcmLayout{}, pcmFinalize{};
     Handle bodyMeasure{}, onsetMeasure{}, audioSummary{}, volumeMatch{}, acceptedLayout{}, acceptedPack{};
     std::string deviceName;
@@ -503,6 +511,12 @@ struct Renderer::Impl {
         driver.check(driver.kernel(&filterSource, module, "renderFilterSources"), "CUDA filter source kernel");
         driver.check(driver.kernel(&filterPass, module, "applyVoiceFilters"), "CUDA filter kernel");
         driver.check(driver.kernel(&pitchPass, module, "prepareVoicePitch"), "CUDA variable pitch kernel");
+        driver.check(driver.kernel(&scheduledMix, module, "scheduledTiles"), "CUDA scheduled mix kernel");
+        driver.check(driver.kernel(&scheduledSource, module, "scheduledSources"), "CUDA scheduled source kernel");
+        driver.check(driver.kernel(&scheduledPitch, module, "scheduledPitch"), "CUDA scheduled pitch kernel");
+        driver.check(driver.kernel(&scheduledFilter, module, "scheduledFilters"), "CUDA scheduled filter kernel");
+        driver.check(driver.kernel(&scheduledFinish, module, "scheduledFinish"), "CUDA scheduled finishing kernel");
+        driver.check(driver.kernel(&scheduledPackLayout, module, "scheduledPackLayout"), "CUDA completion layout kernel");
         driver.check(driver.kernel(&pcmLayout, module, "layoutPcm"), "CUDA PCM layout kernel");
         driver.check(driver.kernel(&pcmFinalize, module, "finalizePcm"), "CUDA PCM finalization kernel");
         if (audio.enabled || groupMinimum) {
@@ -533,7 +547,7 @@ struct Renderer::Impl {
 
     void recordPeak(size_t extra = 0)
     {
-        peak = std::max(peak, sinc.capacity + samples.capacity + arena.capacity + groupControl.capacity + waiting + extra);
+        peak = std::max(peak, sinc.capacity + samples.capacity + arena.capacity + groupControl.capacity + waiting + residentBytes + extra);
     }
 
     void uploadSamples(const AudioBank& bank, bool fresh)
@@ -709,6 +723,14 @@ struct Renderer::Impl {
         size_t failedScratchBytes{};
     };
 
+    struct Pending {
+        BatchIndex index;
+        ScheduledJob device{};
+        FinishJob finishing{};
+        Synthesis work;
+        int frame = 0;
+    };
+
     int channels() const { return natural ? 1 : 2; }
 
     int bodyWindows(int frames) const
@@ -763,7 +785,7 @@ struct Renderer::Impl {
     }
 
     Synthesis trySynthesize(const std::vector<RenderPlan>& plans, size_t first, size_t stop, const TimingEvent& begin,
-                            const std::vector<size_t>& sizes, size_t& maxJobs, size_t& scratchLimit)
+                            const std::vector<size_t>& sizes, size_t& maxJobs, size_t& scratchLimit, Pending* pending = nullptr)
     {
         const auto frameBytes = 2 * (natural ? sizeof(float) : sizeof(int16_t));
         size_t free{}, total{};
@@ -850,7 +872,7 @@ struct Renderer::Impl {
         const auto fullFilterBytes = index.filteredSamples * sizeof(float);
         const auto fullPhaseOffset = (fullFilterBytes + 15) & ~size_t{15};
         const auto fullScratchBytes = fullPhaseOffset + index.pitchFrames * sizeof(double);
-        if (fullScratchBytes > scratchBudget) {
+        if (!pending && fullScratchBytes > scratchBudget) {
             for (const auto& voice : index.voices) {
                 if (voice.filterTrack < 0)
                     continue;
@@ -882,7 +904,7 @@ struct Renderer::Impl {
         std::vector<Segment> segments;
         size_t filterBytes = 0;
         for (int firstFrame = 0; firstFrame < lastFrame;) {
-            if (fullScratchBytes <= scratchBudget) {
+            if (pending || fullScratchBytes <= scratchBudget) {
                 segments.push_back({0, lastFrame, index.filteredSamples, index.pitchFrames});
                 filterBytes = fullScratchBytes;
                 break;
@@ -917,8 +939,15 @@ struct Renderer::Impl {
             std::sort(index.filterTiles.begin(), index.filterTiles.end(),
                 [](const auto& a, const auto& b) { return a.frame < b.frame; });
         }
-        const auto bytes = scratchOffset + std::max(finishing.bytes, filterBytes);
+        if (pending) {
+            std::sort(index.tiles.begin(), index.tiles.end(), [](const auto& a, const auto& b) { return a.frame < b.frame; });
+            std::sort(index.filterTiles.begin(), index.filterTiles.end(),
+                [](const auto& a, const auto& b) { return a.frame < b.frame; });
+        }
+        const auto bytes = scratchOffset + (pending ? finishing.bytes : std::max(finishing.bytes, filterBytes));
         auto allocation = arena.tryAllocate(bytes);
+        if (pending && allocation == cudaOutOfMemory)
+            return {};
         if (allocation == cudaOutOfMemory && filterBytes > std::max(finishing.bytes, size_t{2} * 1024 * 1024)) {
             scratchLimit = filterBytes / 2;
             return {};
@@ -962,10 +991,14 @@ struct Renderer::Impl {
         if (!filterScratch)
             filterScratch = finishScratch;
         recordPeak();
+        std::vector<unsigned char> staging(pending ? mixOffset : 0);
         const auto upload = [&](size_t offset, const auto& items) {
             auto address = base + offset;
-            if (!items.empty())
-                uploadScratch(address, items.data(), items.size() * sizeof(items.front()), "CUDA batch upload");
+            if (!items.empty()) {
+                const auto bytes = items.size() * sizeof(items.front());
+                if (pending) std::memcpy(staging.data() + offset, items.data(), bytes);
+                else uploadScratch(address, items.data(), bytes, "CUDA batch upload");
+            }
             return address;
         };
         auto voices = upload(voiceOffset, index.voices);
@@ -983,6 +1016,33 @@ struct Renderer::Impl {
         // After mono conversion the float mix is dead, so its allocation also holds the compact PCM.
         auto packed = mix;
         auto assessment = upload(audioOffset, audioJobs), starts = upload(onsetOffset, onsets);
+        synthesis.jobData = jobData;
+        synthesis.resultData = resultData;
+        synthesis.source = packed;
+        synthesis.output = natural ? mono : finishScratch + stereoOutput;
+        synthesis.pcmJobs = finishScratch + pcmJobOffset;
+        synthesis.blocks = blocks;
+        if (pending) {
+            upload(tileOffset, index.tiles);
+            upload(filterTileOffset, index.filterTiles);
+            uploadScratch(base, staging.data(), staging.size(), "CUDA resident metadata upload");
+            pending->device = {reinterpret_cast<const VoiceSpan*>(voices), reinterpret_cast<const Tile*>(tiles),
+                reinterpret_cast<const FilterTile*>(filterTiles), reinterpret_cast<const int*>(indices),
+                reinterpret_cast<const int*>(pitchHeads), reinterpret_cast<const int*>(filterHeads),
+                reinterpret_cast<const ControlPoint*>(controls), reinterpret_cast<const VoiceModulation*>(modulation),
+                reinterpret_cast<VoiceState*>(stateData), nullptr, nullptr, reinterpret_cast<void*>(mix),
+                0, 0, 0, 0, 0, 0, 0, 0};
+            pending->finishing = {reinterpret_cast<const TailJob*>(jobData), reinterpret_cast<const AudioJob*>(assessment),
+                reinterpret_cast<const int*>(starts), reinterpret_cast<const void*>(mix), reinterpret_cast<short*>(mono),
+                reinterpret_cast<short*>(packed), reinterpret_cast<short*>(synthesis.output),
+                reinterpret_cast<StereoStats*>(finishScratch + statsOffset), reinterpret_cast<MonoStats*>(finishScratch + windowOffset),
+                reinterpret_cast<unsigned long long*>(finishScratch + bodyPowerOffset),
+                reinterpret_cast<unsigned long long*>(finishScratch + onsetPowerOffset), reinterpret_cast<TailResult*>(resultData),
+                reinterpret_cast<PcmJob*>(synthesis.pcmJobs), blocks, windows, bodyBlocks, int(onsets.size()), nullptr, 0};
+            pending->index = std::move(index);
+            pending->work = synthesis;
+            return synthesis;
+        }
         begin.record();
         for (const auto& segment : segments) {
             auto segmentFirst = segment.first, segmentEnd = segment.end;
@@ -1069,12 +1129,6 @@ struct Renderer::Impl {
             driver.check(driver.launch(audioSummary, (count + 31) / 32, 1, 1, 32, 1, 1, 0, nullptr, args, nullptr),
                 "CUDA audio assessment launch");
         }
-        synthesis.jobData = jobData;
-        synthesis.resultData = resultData;
-        synthesis.source = packed;
-        synthesis.output = natural ? mono : finishScratch + stereoOutput;
-        synthesis.pcmJobs = finishScratch + pcmJobOffset;
-        synthesis.blocks = blocks;
         return synthesis;
     }
 
@@ -1145,9 +1199,9 @@ struct Renderer::Impl {
         std::shared_ptr<int16_t> host;
     };
 
-    Retained retain(Synthesis& work, size_t first, DevicePtr destination, const TimingEvent& end)
+    Retained retain(Synthesis& work, size_t first, DevicePtr destination, const TimingEvent& end, bool packed = false)
     {
-        pack(work);
+        if (!packed) pack(work);
         const auto resultBytes = work.jobs.size() * sizeof(TailResult);
         copyScratch(destination, work.resultData, resultBytes, "CUDA retain group metadata");
         end.record();
@@ -1294,7 +1348,405 @@ struct Renderer::Impl {
         return group.end;
     }
 
-    void renderWindow(const std::vector<RenderPlan>& plans, const std::function<void(RenderBatch, size_t)>& publish)
+    // Keep independent job state resident and fuse each scheduling round into four launches.
+    // Completed jobs release their synthesis storage before the next queue admission.
+    void renderRolling(std::vector<RenderPlan>& plans, const Refill& refill,
+                       const std::function<void(RenderBatch, size_t)>& publish)
+    {
+        struct Resident {
+            Buffer storage;
+            Pending pending;
+            size_t first;
+            Resident(Driver& driver, size_t index) : storage(driver), first(index) {}
+        };
+        std::vector<std::unique_ptr<Resident>> active;
+        Buffer scratch(driver), descriptors(driver);
+        struct Group {
+            AudioGroup range;
+            int remaining;
+            std::unique_ptr<Buffer> metadata;
+            std::vector<Retained> retained;
+        };
+        std::vector<Group> groups;
+        std::vector<int> groupOf;
+        constexpr size_t resultOffset = 16;
+        const auto registerJobs = [&] {
+            const auto firstNew = groupOf.size();
+            groupOf.resize(plans.size(), -1);
+            for (size_t first = firstNew, end; first < plans.size(); first = end) {
+                end = first + 1;
+                const auto id = plans[first].volumeGroup;
+                if (!id) continue;
+                while (end < plans.size() && plans[end].volumeGroup == id) ++end;
+                const auto g = int(groups.size());
+                groups.push_back({{int(first), int(end)}, int(end - first), {}, {}});
+                std::fill(groupOf.begin() + first, groupOf.begin() + end, g);
+            }
+        };
+        registerJobs();
+        arena.reset();
+        double seconds = 0;
+        size_t admitted = 0, rounds = 0, refills = 0;
+        const auto account = [&] {
+            residentBytes = scratch.capacity + descriptors.capacity;
+            for (const auto& item : active)
+                residentBytes += item->storage.capacity;
+            for (const auto& group : groups)
+                if (group.metadata) residentBytes += group.metadata->capacity;
+            recordPeak();
+        };
+        const auto emit = [&](RenderBatch batch, size_t first) {
+            batch.kernelSeconds += seconds;
+            seconds = 0;
+            publish(std::move(batch), first);
+        };
+        const auto complete = [&](Synthesis& work, size_t first, const TimingEvent& begin, bool packed = false) {
+            TimingEvent end(driver);
+            const auto g = groupOf[first];
+            DevicePtr groupData = 0, resultData = 0, destination = 0;
+            if (g >= 0) {
+                auto& group = groups[g];
+                if (!group.metadata) {
+                    group.metadata = std::make_unique<Buffer>(driver);
+                    group.metadata->allocate(resultOffset + (group.range.end - group.range.first) * sizeof(TailResult));
+                    driver.check(driver.put(group.metadata->address, &group.range, sizeof(AudioGroup)), "CUDA rolling group");
+                }
+                groupData = group.metadata->address;
+                resultData = groupData + resultOffset;
+                destination = resultData + (first - group.range.first) * sizeof(TailResult);
+            }
+            if (work.failedScratchBytes) {
+                if (g >= 0) {
+                    TailResult rejected{};
+                    rejected.status = TailStatus::scratchMemory;
+                    driver.check(driver.put(destination, &rejected, sizeof(rejected)),
+                        "CUDA rolling rejected metadata");
+                }
+                emit({{}, {}, 0, work.failedScratchBytes}, first);
+            } else if (g >= 0) {
+                groups[g].retained.push_back(retain(work, first, destination, end, packed));
+                seconds += timing(begin, end);
+            } else {
+                const bool assess = audio.enabled || groupMinimum;
+                if (assess && !packed) pack(work);
+                end.record();
+                emit(download(work, assess ? work.output : work.source, begin, end), first);
+            }
+            if (g < 0 || --groups[g].remaining)
+                return;
+            match(groupData, 1, groups[g].range.first, resultData);
+            for (auto& chunk : groups[g].retained) {
+                emit(packRetained(chunk, resultData + (chunk.first - groups[g].range.first) * sizeof(TailResult)), chunk.first);
+                if (chunk.device) waiting -= chunk.bytes;
+            }
+            groups[g].retained.clear();
+            groups[g].metadata.reset();
+            // Group repacking must not reserve memory needed by newly admitted synthesis jobs.
+            arena.reset();
+        };
+        for (;;) {
+            while (active.size() < batchJobs) {
+                if (admitted == plans.size()) {
+                    if (!refill || !refill(plans, active.empty())) break;
+                    registerJobs();
+                }
+                size_t free{}, total{};
+                driver.check(driver.memory(&free, &total), "CUDA rolling admission budget");
+                if (!active.empty() && footprint(plans[admitted]) > free / 2)
+                    break;
+                auto item = std::make_unique<Resident>(driver, admitted);
+                TimingEvent begin(driver);
+                size_t cap = 1, limit = std::numeric_limits<size_t>::max();
+                // The ordinary arena is temporarily borrowed for preparation only.
+                arena.swap(item->storage);
+                auto work = trySynthesize(plans, admitted, admitted + 1, begin, {}, cap, limit, &item->pending);
+                arena.swap(item->storage);
+                if (work.jobs.empty()) {
+                    if (!active.empty()) break;
+                    // No live synthesis state is at risk: retain the established single-job recovery path.
+                    scratch.reset();
+                    descriptors.reset();
+                    account();
+                    auto fallback = synthesize(plans, admitted, admitted + 1, begin);
+                    complete(fallback, admitted, begin);
+                    plans[admitted] = {};
+                    arena.reset();
+                    ++admitted;
+                    continue;
+                }
+                if (rounds && !active.empty()) ++refills;
+                active.push_back(std::move(item));
+                ++admitted;
+                account();
+            }
+            if (active.empty()) {
+                if (admitted == plans.size()) break;
+                continue;
+            }
+            int shortest = std::numeric_limits<int>::max(), longest = 0;
+            size_t tracks = 0;
+            for (const auto& item : active) {
+                const int remaining = plans[item->first].frames - item->pending.frame;
+                shortest = std::min(shortest, remaining);
+                longest = std::max(longest, remaining);
+                const auto& index = item->pending.index;
+                tracks += std::max(index.filterHeads.size(), index.pitchHeads.size());
+            }
+            int quantum = admitted < plans.size() || refill ? std::min(longest, std::max(shortest, audio.rate / 4)) : longest;
+            // Preserve parallelism across independent notes before shortening for memory.
+            // A single long voice cannot gain more parallel tracks merely by using a longer segment.
+            const auto target = tracks;
+            while (quantum < longest && target) {
+                size_t parallel = 0;
+                for (const auto& item : active) {
+                    const auto& pending = item->pending;
+                    const auto& index = pending.index;
+                    const auto& heads = index.filterHeads.size() >= index.pitchHeads.size() ? index.filterHeads : index.pitchHeads;
+                    const int end = pending.frame + std::min(quantum, plans[item->first].frames - pending.frame);
+                    for (auto head : heads) {
+                        if (parallel >= target) break;
+                        for (int span = head; span >= 0; span = index.voices[span].nextFilteredSpan) {
+                            const auto& voice = index.voices[span];
+                            if (voice.begin >= end) break;
+                            if (voice.end > pending.frame) { ++parallel; break; }
+                        }
+                    }
+                }
+                if (parallel >= target) break;
+                quantum += std::min(quantum, longest - quantum);
+            }
+            size_t free{}, total{};
+            driver.check(driver.memory(&free, &total), "CUDA rolling scratch budget");
+            const auto available = free + scratch.capacity;
+            size_t budget = std::min(total / 4, available - available / 8);
+            std::vector<ScheduledJob> jobs;
+            size_t bytes = 0;
+            bool recover = false;
+            for (;;) {
+                jobs.clear();
+                bytes = 0;
+                for (auto& item : active) {
+                    auto& pending = item->pending;
+                    auto job = pending.device;
+                    job.first = pending.frame;
+                    job.end = job.first + std::min(quantum, plans[item->first].frames - job.first);
+                    size_t samples = 0, phases = 0;
+                    for (auto& voice : pending.index.voices) {
+                        if (voice.filterTrack < 0) continue;
+                        const auto frames = std::max(0, std::min(voice.end, job.end) - std::max(voice.begin, job.first));
+                        voice.filteredOffset = samples;
+                        voice.phaseOffset = phases;
+                        samples += size_t(frames) * voice.channels;
+                        if (voice.variablePitch) phases += frames;
+                    }
+                    job.filtered = reinterpret_cast<float*>(bytes);
+                    bytes = (bytes + samples * sizeof(float) + 15) & ~size_t{15};
+                    job.phase = reinterpret_cast<double*>(bytes);
+                    bytes = (bytes + phases * sizeof(double) + 15) & ~size_t{15};
+                    jobs.push_back(job);
+                }
+                if (bytes <= budget) {
+                    const auto status = scratch.tryAllocate(bytes);
+                    if (status != cudaOutOfMemory) {
+                        driver.check(status, "CUDA rolling scratch allocation");
+                        break;
+                    }
+                    budget = bytes / 2;
+                }
+                if (quantum == 1) {
+                    recover = true;
+                    break;
+                }
+                quantum = std::max(1, quantum / 2);
+            }
+            if (recover) {
+                std::vector<size_t> retry;
+                for (const auto& item : active) retry.push_back(item->first);
+                active.clear();
+                scratch.reset();
+                descriptors.reset();
+                account();
+                for (auto first : retry) {
+                    TimingEvent begin(driver);
+                    auto work = synthesize(plans, first, first + 1, begin);
+                    complete(work, first, begin);
+                    plans[first] = {};
+                    arena.reset();
+                }
+                continue;
+            }
+            int tiles = 0, sources = 0, pitches = 0, filters = 0;
+            for (size_t i = 0; i < active.size(); ++i) {
+                auto& pending = active[i]->pending;
+                auto& job = jobs[i];
+                job.filtered = reinterpret_cast<float*>(scratch.address + reinterpret_cast<size_t>(job.filtered));
+                job.phase = reinterpret_cast<double*>(scratch.address + reinterpret_cast<size_t>(job.phase));
+                const auto& index = pending.index;
+                if (index.filteredSamples && (job.first || job.end < plans[active[i]->first].frames))
+                    uploadScratch(reinterpret_cast<DevicePtr>(job.voices), index.voices.data(),
+                        index.voices.size() * sizeof(VoiceSpan), "CUDA rolling voice offsets");
+                const auto range = [&](const auto& items, int& first) {
+                    auto start = std::lower_bound(items.begin(), items.end(), job.first - threads + 1,
+                        [](const auto& tile, int frame) { return tile.frame < frame; });
+                    auto stop = std::lower_bound(start, items.end(), job.end,
+                        [](const auto& tile, int frame) { return tile.frame < frame; });
+                    first = int(start - items.begin());
+                    return int(stop - start);
+                };
+                const auto heads = [&](const auto& items, const int* destination) {
+                    std::vector<int> selected;
+                    for (auto head : items) {
+                        for (int span = head; span >= 0; span = index.voices[span].nextFilteredSpan) {
+                            const auto& voice = index.voices[span];
+                            if (voice.begin >= job.end) break;
+                            if (voice.end > job.first) { selected.push_back(head); break; }
+                        }
+                    }
+                    if (!selected.empty())
+                        uploadScratch(reinterpret_cast<DevicePtr>(destination), selected.data(), selected.size() * sizeof(int),
+                            "CUDA rolling active tracks");
+                    return int(selected.size());
+                };
+                job.tileEnd = (tiles += range(index.tiles, job.tileFirst));
+                job.sourceEnd = (sources += range(index.filterTiles, job.sourceFirst));
+                job.pitchEnd = (pitches += heads(index.pitchHeads, job.pitchHeads));
+                job.filterEnd = (filters += heads(index.filterHeads, job.filterHeads));
+            }
+            descriptors.upload(jobs);
+            account();
+            auto deviceJobs = descriptors.address;
+            int count = int(jobs.size());
+            TimingEvent begin(driver), end(driver);
+            begin.record();
+            const auto recurrence = [&](Handle kernel, int tracks) {
+                if (!tracks) return;
+                const int width = std::clamp(1 + (tracks - 1) / (2 * multiprocessors), 1, 32);
+                void* args[] = {&deviceJobs, &count, &tracks};
+                driver.check(driver.launch(kernel, 1 + (tracks - 1) / width, 1, 1, width, 1, 1, 0,
+                    nullptr, args, nullptr), "CUDA scheduled recurrence");
+            };
+            recurrence(scheduledPitch, pitches);
+            launchChunks(scheduledSource, sources, threads, sampleData, sinc.address, deviceJobs, count);
+            recurrence(scheduledFilter, filters);
+            launchChunks(scheduledMix, tiles, threads, sampleData, sinc.address, deviceJobs, count);
+            end.record();
+            driver.check(driver.synchronize(), "CUDA rolling round completion");
+            const auto elapsed = timing(begin, end);
+            seconds += elapsed;
+            ++rounds;
+            std::vector<FinishJob> finishing;
+            for (size_t i = 0; i < active.size(); ++i) {
+                if (jobs[i].end != plans[active[i]->first].frames) continue;
+                auto job = active[i]->pending.finishing;
+                if (!finishing.empty()) {
+                    job.blocks += finishing.back().blocks;
+                    job.windowsEnd += finishing.back().windowsEnd;
+                    job.bodyEnd += finishing.back().bodyEnd;
+                    job.onsetEnd += finishing.back().onsetEnd;
+                }
+                finishing.push_back(job);
+            }
+            bool combined = !finishing.empty();
+            size_t outputFrames = 0;
+            for (size_t i = 0; i < active.size(); ++i) {
+                if (jobs[i].end != plans[active[i]->first].frames) continue;
+                combined &= groupOf[active[i]->first] < 0;
+                outputFrames += plans[active[i]->first].frames;
+            }
+            if (combined) {
+                const auto status = scratch.tryAllocate(outputFrames * channels() * sizeof(int16_t));
+                if (status != cudaOutOfMemory) driver.check(status, "CUDA completion transfer allocation");
+                else combined = false;
+            }
+            if (!finishing.empty()) {
+                descriptors.allocate(finishing.size() * (sizeof(FinishJob) + sizeof(TailResult)));
+                auto data = descriptors.address;
+                const auto summary = data + finishing.size() * sizeof(FinishJob);
+                size_t offset = 0, j = 0;
+                for (size_t i = 0; i < active.size(); ++i) {
+                    if (jobs[i].end != plans[active[i]->first].frames) continue;
+                    auto& job = finishing[j];
+                    job.summary = reinterpret_cast<TailResult*>(summary + j * sizeof(TailResult));
+                    job.outputOffset = offset;
+                    if (combined) {
+                        job.output = reinterpret_cast<short*>(scratch.address + offset * channels() * sizeof(int16_t));
+                        if (!audio.enabled && !groupMinimum) job.packed = job.output;
+                    }
+                    offset += plans[active[i]->first].frames;
+                    ++j;
+                }
+                driver.check(driver.put(data, finishing.data(), finishing.size() * sizeof(FinishJob)), "CUDA finishing descriptors");
+                account();
+                int finished = int(finishing.size());
+                TimingEvent finishBegin(driver), finishEnd(driver);
+                finishBegin.record();
+                const auto finishStage = [&](int stage, int blocks, int width) {
+                    launchChunks(scheduledFinish, blocks, width, data, finished, stage, tail, audio);
+                };
+                const auto compact = [&] {
+                    auto output = scratch.address;
+                    void* args[] = {&data, &finished, &output};
+                    driver.check(driver.launch(scheduledPackLayout, 1, 1, 1, 1, 1, 1, 0,
+                        nullptr, args, nullptr), "CUDA compact completion layout");
+                };
+                const auto& last = finishing.back();
+                if (natural) {
+                    finishStage(0, last.blocks, 128);
+                    finishStage(1, finished, 1);
+                    finishStage(2, last.windowsEnd, 256);
+                    finishStage(3, finished, 1);
+                }
+                finishStage(4, finished, 1);
+                if (combined && !audio.enabled && !groupMinimum) compact();
+                finishStage(5, last.blocks, 128);
+                if (audio.enabled || groupMinimum) {
+                    finishStage(6, last.bodyEnd, 128);
+                    if (audio.enabled) finishStage(7, last.onsetEnd, 160);
+                    finishStage(8, finished, 1);
+                    finishStage(9, finished, 1);
+                    if (combined) compact();
+                    finishStage(10, last.blocks, 128);
+                }
+                if (combined) finishStage(11, finished, 1);
+                finishEnd.record();
+                driver.check(driver.synchronize(), "CUDA scheduled finishing completion");
+                seconds += timing(finishBegin, finishEnd);
+                if (combined) {
+                    RenderBatch batch;
+                    batch.results.resize(finishing.size());
+                    driver.check(driver.get(batch.results.data(), summary, batch.results.size() * sizeof(TailResult)),
+                        "CUDA completion metadata download");
+                    size_t samplesCount = 0;
+                    for (const auto& result : batch.results)
+                        if (result.dataFrames) samplesCount = std::max(samplesCount, size_t(result.offset + result.dataFrames) * channels());
+                    batch.pcm = receivePcm(scratch.address, samplesCount);
+                    downloaded += samplesCount * sizeof(int16_t);
+                    for (size_t i = 0; i < active.size(); ++i)
+                        if (jobs[i].end == plans[active[i]->first].frames) batch.jobIndices.push_back(active[i]->first);
+                    const auto first = batch.jobIndices.front();
+                    emit(std::move(batch), first);
+                }
+            }
+            for (size_t i = active.size(); i-- > 0;) {
+                auto& item = *active[i];
+                item.pending.frame = jobs[i].end;
+                if (item.pending.frame != plans[item.first].frames) continue;
+                if (!combined) {
+                    TimingEvent finishBegin(driver);
+                    finishBegin.record();
+                    complete(item.pending.work, item.first, finishBegin, true);
+                }
+                plans[item.first] = {};
+                active.erase(active.begin() + i);
+            }
+            account();
+        }
+        residentBytes = 0;
+        std::cerr << "SCHEDULE\tjobs=" << plans.size() << "\trounds=" << rounds << "\trefills=" << refills << '\n';
+    }
+
+    void renderWindow(std::vector<RenderPlan>& plans, const std::function<void(RenderBatch, size_t)>& publish,
+                      const Refill& refill)
     {
         std::vector<AudioGroup> groups;
         size_t largest = 0;
@@ -1307,6 +1759,11 @@ struct Renderer::Impl {
                 ++end;
             groups.push_back({int(first), int(end)});
             largest = std::max(largest, end - first);
+        }
+        const bool recurrences = std::any_of(plans.begin(), plans.end(), [](const auto& plan) { return plan.filterTracks != 0; });
+        if (batchJobs > 1 && (refill || plans.size() > batchJobs) && recurrences) {
+            renderRolling(plans, refill, publish);
+            return;
         }
         if (groups.empty()) {
             for (size_t first = 0; first < plans.size();) {
@@ -1376,9 +1833,10 @@ void Renderer::uploadSamples(const AudioBank& bank, bool fresh)
     impl_->uploadSamples(bank, fresh);
 }
 
-void Renderer::renderWindow(const std::vector<RenderPlan>& plans, const std::function<void(RenderBatch, size_t)>& publish)
+void Renderer::renderWindow(std::vector<RenderPlan>& plans, const std::function<void(RenderBatch, size_t)>& publish,
+                            const Refill& refill)
 {
-    impl_->renderWindow(plans, publish);
+    impl_->renderWindow(plans, publish, refill);
 }
 const std::string& Renderer::device() const { return impl_->deviceName; }
 size_t Renderer::peakBytes() const { return impl_->peak; }

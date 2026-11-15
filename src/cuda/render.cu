@@ -192,11 +192,11 @@ __device__ float jobGain(const ControlPoint* controls, const int* offsets, int f
            controlAt(controls, offsets[1], offsets[2], frame);
 }
 
-extern "C" __global__ void renderFilterSources(const float* samples, const float* sinc, const VoiceSpan* voices,
+__device__ void renderFilterSource(const float* samples, const float* sinc, const VoiceSpan* voices,
     const FilterTile* tiles, const ControlPoint* controls, const VoiceModulation* modulation,
-    const double* phase, float* filtered, int segmentFirst, int segmentEnd, int segmentFrames, int firstTile)
+    const double* phase, float* filtered, int segmentFirst, int segmentEnd, int segmentFrames, int tileIndex)
 {
-    const auto tile = tiles[firstTile + blockIdx.x];
+    const auto tile = tiles[tileIndex];
     const auto& voice = voices[tile.span];
     const auto frame = tile.frame + int(threadIdx.x);
     if (frame >= voice.end || frame < segmentFirst || frame >= segmentEnd)
@@ -212,12 +212,16 @@ extern "C" __global__ void renderFilterSources(const float* samples, const float
         destination[1] = sample.y * gain;
 }
 
-extern "C" __global__ void prepareVoicePitch(const VoiceSpan* voices, const int* heads,
-    const ControlPoint* controls, const VoiceModulation* modulation, double* phase, VoiceState* states, int segmentFirst, int segmentEnd, int segmentFrames, int count)
+extern "C" __global__ void renderFilterSources(const float* samples, const float* sinc, const VoiceSpan* voices,
+    const FilterTile* tiles, const ControlPoint* controls, const VoiceModulation* modulation,
+    const double* phase, float* filtered, int segmentFirst, int segmentEnd, int segmentFrames, int firstTile)
 {
-    const auto track = int(blockIdx.x * blockDim.x + threadIdx.x);
-    if (track >= count)
-        return;
+    renderFilterSource(samples, sinc, voices, tiles, controls, modulation, phase, filtered, segmentFirst, segmentEnd, segmentFrames, int(firstTile + blockIdx.x));
+}
+
+__device__ void preparePitch(const VoiceSpan* voices, const int* heads,
+    const ControlPoint* controls, const VoiceModulation* modulation, double* phase, VoiceState* states, int segmentFirst, int segmentEnd, int segmentFrames, int track)
+{
     const auto head = heads[track];
     if (!voices[head].variablePitch)
         return;
@@ -259,6 +263,14 @@ extern "C" __global__ void prepareVoicePitch(const VoiceSpan* voices, const int*
         state.previousLoopEnd = previousLoopEnd;
         state.previousLoopStart = previousLoopStart;
     }
+}
+
+extern "C" __global__ void prepareVoicePitch(const VoiceSpan* voices, const int* heads,
+    const ControlPoint* controls, const VoiceModulation* modulation, double* phase, VoiceState* states, int segmentFirst, int segmentEnd, int segmentFrames, int count)
+{
+    const auto track = int(blockIdx.x * blockDim.x + threadIdx.x);
+    if (track >= count) return;
+    preparePitch(voices, heads, controls, modulation, phase, states, segmentFirst, segmentEnd, segmentFrames, track);
 }
 
 using Coefficients = FilterCoefficients;
@@ -323,12 +335,9 @@ __device__ float filterSample(float x, const Coefficients& c, float& z1, float& 
     return y;
 }
 
-extern "C" __global__ void applyVoiceFilters(const VoiceSpan* voices, const int* heads,
-    const ControlPoint* controls, const VoiceModulation* modulation, float* filtered, VoiceState* states, int segmentFirst, int segmentEnd, int segmentFrames, int count)
+__device__ void applyFilter(const VoiceSpan* voices, const int* heads,
+    const ControlPoint* controls, const VoiceModulation* modulation, float* filtered, VoiceState* states, int segmentFirst, int segmentEnd, int segmentFrames, int track)
 {
-    const auto track = int(blockIdx.x * blockDim.x + threadIdx.x);
-    if (track >= count)
-        return;
     bool hasFilters = false;
     for (const auto& filter : voices[heads[track]].filters)
         hasFilters |= filter.type != FilterType::none;
@@ -438,6 +447,14 @@ extern "C" __global__ void applyVoiceFilters(const VoiceSpan* voices, const int*
 
 }
 
+extern "C" __global__ void applyVoiceFilters(const VoiceSpan* voices, const int* heads,
+    const ControlPoint* controls, const VoiceModulation* modulation, float* filtered, VoiceState* states, int segmentFirst, int segmentEnd, int segmentFrames, int count)
+{
+    const auto track = int(blockIdx.x * blockDim.x + threadIdx.x);
+    if (track >= count) return;
+    applyFilter(voices, heads, controls, modulation, filtered, states, segmentFirst, segmentEnd, segmentFrames, track);
+}
+
 __device__ float2 mixFrame(const float* samples, const float* sinc, const VoiceSpan* voices,
                           const Tile& tile, const int* indices, const ControlPoint* controls,
                           const VoiceModulation* modulation, const float* filtered, int frame, int segmentFirst)
@@ -480,12 +497,12 @@ using OutputFrame = float2;
 using OutputFrame = short2;
 #endif
 
-extern "C" __global__ void renderTiles(const float* samples, const float* sinc, const VoiceSpan* voices,
+__device__ void renderTile(const float* samples, const float* sinc, const VoiceSpan* voices,
                                       const Tile* tiles, const int* indices, const ControlPoint* controls,
                                       const VoiceModulation* modulation, const float* filtered,
-                                      OutputFrame* output, int segmentFirst, int segmentEnd, int segmentFrames, int firstTile)
+                                      OutputFrame* output, int segmentFirst, int segmentEnd, int segmentFrames, int tileIndex)
 {
-    const Tile tile = tiles[firstTile + blockIdx.x];
+    const Tile tile = tiles[tileIndex];
     const auto lane = int(threadIdx.x);
     if (lane >= tile.frames || tile.frame + lane < segmentFirst || tile.frame + lane >= segmentEnd)
         return;
@@ -495,4 +512,70 @@ extern "C" __global__ void renderTiles(const float* samples, const float* sinc, 
 #else
     output[tile.output + lane] = make_short2(pcm16(mixed.x), pcm16(mixed.y));
 #endif
+}
+
+extern "C" __global__ void renderTiles(const float* samples, const float* sinc, const VoiceSpan* voices,
+                                      const Tile* tiles, const int* indices, const ControlPoint* controls,
+                                      const VoiceModulation* modulation, const float* filtered,
+                                      OutputFrame* output, int segmentFirst, int segmentEnd, int segmentFrames, int firstTile)
+{
+    renderTile(samples, sinc, voices, tiles, indices, controls, modulation, filtered, output, segmentFirst, segmentEnd, segmentFrames, int(firstTile + blockIdx.x));
+}
+
+// Each launch combines work from all resident jobs; their audio clocks remain independent.
+__device__ int scheduledJob(const ScheduledJob* jobs, int count, int index, int kind)
+{
+    int low = 0, high = count;
+    while (low < high) {
+        const int middle = (low + high) / 2;
+        const auto& job = jobs[middle];
+        const int end = kind == 0 ? job.tileEnd : kind == 1 ? job.sourceEnd : kind == 2 ? job.pitchEnd : job.filterEnd;
+        if (index < end) high = middle;
+        else low = middle + 1;
+    }
+    return low;
+}
+
+extern "C" __global__ void scheduledTiles(const float* samples, const float* sinc,
+    const ScheduledJob* jobs, int count, int firstTile)
+{
+    const int index = firstTile + blockIdx.x;
+    const int slot = scheduledJob(jobs, count, index, 0);
+    const auto& job = jobs[slot];
+    const int local = index - (slot ? jobs[slot - 1].tileEnd : 0);
+    renderTile(samples, sinc, job.voices, job.tiles, job.indices, job.controls, job.modulation,
+        job.filtered, static_cast<OutputFrame*>(job.mix), job.first, job.end, job.end - job.first, local + job.tileFirst);
+}
+
+extern "C" __global__ void scheduledSources(const float* samples, const float* sinc,
+    const ScheduledJob* jobs, int count, int firstTile)
+{
+    const int index = firstTile + blockIdx.x;
+    const int slot = scheduledJob(jobs, count, index, 1);
+    const auto& job = jobs[slot];
+    const int local = index - (slot ? jobs[slot - 1].sourceEnd : 0);
+    renderFilterSource(samples, sinc, job.voices, job.sourceTiles, job.controls, job.modulation,
+        job.phase, job.filtered, job.first, job.end, job.end - job.first, local + job.sourceFirst);
+}
+
+extern "C" __global__ void scheduledPitch(const ScheduledJob* jobs, int count, int tracks)
+{
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= tracks) return;
+    const int slot = scheduledJob(jobs, count, index, 2);
+    const auto& job = jobs[slot];
+    const int local = index - (slot ? jobs[slot - 1].pitchEnd : 0);
+    preparePitch(job.voices, job.pitchHeads, job.controls, job.modulation, job.phase, job.states,
+        job.first, job.end, job.end - job.first, local);
+}
+
+extern "C" __global__ void scheduledFilters(const ScheduledJob* jobs, int count, int tracks)
+{
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= tracks) return;
+    const int slot = scheduledJob(jobs, count, index, 3);
+    const auto& job = jobs[slot];
+    const int local = index - (slot ? jobs[slot - 1].filterEnd : 0);
+    applyFilter(job.voices, job.filterHeads, job.controls, job.modulation, job.filtered, job.states,
+        job.first, job.end, job.end - job.first, local);
 }

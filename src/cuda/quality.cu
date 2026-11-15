@@ -18,10 +18,9 @@ __device__ int bodyBlockStart(int block, AudioConfig config)
     return (block / windows) * chunk + (block % windows) * span;
 }
 
-extern "C" __global__ void measureBody(const AudioJob* jobs, int count, const short* pcm,
-                                       const TailResult* results, Power* powers, AudioConfig config, int firstBlock)
+__device__ void finishMeasureBody(const AudioJob* jobs, int count, const short* pcm,
+                                       const TailResult* results, Power* powers, AudioConfig config, int block)
 {
-    const int block = firstBlock + blockIdx.x;
     const int index = tailJobFor<&AudioJob::bodyFirst>(jobs, count, block);
     const auto& result = results[index];
     if (result.status != TailStatus::ok)
@@ -39,11 +38,16 @@ extern "C" __global__ void measureBody(const AudioJob* jobs, int count, const sh
         powers[block] = power;
 }
 
-#if CLAY_AUDIO_QA
-extern "C" __global__ void measureOnsets(const AudioJob* jobs, int count, const int* onsets, const short* pcm,
-                                         const TailResult* results, Power* powers, int window, int firstBlock)
+extern "C" __global__ void measureBody(const AudioJob* jobs, int count, const short* pcm,
+                                       const TailResult* results, Power* powers, AudioConfig config, int firstBlock)
 {
-    const int block = firstBlock + blockIdx.x;
+    finishMeasureBody(jobs, count, pcm, results, powers, config, int(firstBlock + blockIdx.x));
+}
+
+#if CLAY_AUDIO_QA
+__device__ void finishMeasureOnsets(const AudioJob* jobs, int count, const int* onsets, const short* pcm,
+                                         const TailResult* results, Power* powers, int window, int block)
+{
     const int index = tailJobFor<&AudioJob::onsetFirst>(jobs, count, block);
     const auto& result = results[index];
     if (result.status != TailStatus::ok)
@@ -64,6 +68,12 @@ extern "C" __global__ void measureOnsets(const AudioJob* jobs, int count, const 
     __syncthreads();
     if (!threadIdx.x)
         powers[block] = max(max(maxima[0], maxima[1]), max(max(maxima[2], maxima[3]), maxima[4]));
+}
+
+extern "C" __global__ void measureOnsets(const AudioJob* jobs, int count, const int* onsets, const short* pcm,
+                                         const TailResult* results, Power* powers, int window, int firstBlock)
+{
+    finishMeasureOnsets(jobs, count, onsets, pcm, results, powers, window, int(firstBlock + blockIdx.x));
 }
 
 __device__ void siftPower(Power* values, int root, int count)
@@ -94,10 +104,9 @@ __device__ double percentile(const Power* values, int count, double fraction, in
 }
 #endif
 
-extern "C" __global__ void summarizeAudio(const AudioJob* jobs, int count, const Power* body, Power* onsets,
-                                          TailResult* results, AudioConfig config)
+__device__ void finishSummarizeAudio(const AudioJob* jobs, int count, const Power* body, Power* onsets,
+                                          TailResult* results, AudioConfig config, int index)
 {
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= count || results[index].status != TailStatus::ok)
         return;
     const auto job = jobs[index];
@@ -154,6 +163,12 @@ extern "C" __global__ void summarizeAudio(const AudioJob* jobs, int count, const
 #endif
 }
 
+extern "C" __global__ void summarizeAudio(const AudioJob* jobs, int count, const Power* body, Power* onsets,
+                                          TailResult* results, AudioConfig config)
+{
+    finishSummarizeAudio(jobs, count, body, onsets, results, config, int(blockIdx.x * blockDim.x + threadIdx.x));
+}
+
 #if CLAY_GROUP_VOLUME
 extern "C" __global__ void matchVolume(const AudioGroup* groups, int count, int base, int minimum, TailResult* results)
 {
@@ -193,7 +208,7 @@ extern "C" __global__ void matchVolume(const AudioGroup* groups, int count, int 
 }
 #endif
 
-extern "C" __global__ void layoutAccepted(const TailJob* jobs, int count, TailResult* results, PcmJob* pcm)
+__device__ void finishLayoutAccepted(const TailJob* jobs, int count, TailResult* results, PcmJob* pcm)
 {
     unsigned long long offset = 0;
     for (int i = 0; i < count; ++i) {
@@ -211,10 +226,14 @@ extern "C" __global__ void layoutAccepted(const TailJob* jobs, int count, TailRe
     }
 }
 
-extern "C" __global__ void packAccepted(const PcmJob* jobs, int count, const short* source, short* output,
-                                        TailResult* results, int firstBlock)
+extern "C" __global__ void layoutAccepted(const TailJob* jobs, int count, TailResult* results, PcmJob* pcm)
 {
-    const int block = firstBlock + blockIdx.x;
+    finishLayoutAccepted(jobs, count, results, pcm);
+}
+
+__device__ void finishPackAccepted(const PcmJob* jobs, int count, const short* source, short* output,
+                                        TailResult* results, int block)
+{
     const int index = tailJobFor<&PcmJob::blockFirst>(jobs, count, block);
     const auto job = jobs[index];
     const auto& result = results[index];
@@ -254,4 +273,75 @@ extern "C" __global__ void packAccepted(const PcmJob* jobs, int count, const sho
     }
 }
 
+extern "C" __global__ void packAccepted(const PcmJob* jobs, int count, const short* source, short* output,
+                                        TailResult* results, int firstBlock)
+{
+    finishPackAccepted(jobs, count, source, output, results, int(firstBlock + blockIdx.x));
+}
+
 #endif
+
+// Tail and quality work for newly completed jobs is combined across the resident set.
+extern "C" __global__ void scheduledFinish(const FinishJob* jobs, int count, int stage,
+    TailConfig tail, AudioConfig audio, int firstBlock)
+{
+    const int block = firstBlock + blockIdx.x;
+    const bool scalar = stage == 1 || stage == 3 || stage == 4 || stage == 8 || stage == 9 || stage == 11;
+    int slot = block, local = 0;
+    if (scalar) {
+        if (threadIdx.x) return;
+    } else {
+        int low = 0, high = count;
+        while (low < high) {
+            const int middle = (low + high) / 2;
+            const auto& job = jobs[middle];
+            const int end = stage == 2 ? job.windowsEnd : stage == 6 ? job.bodyEnd : stage == 7 ? job.onsetEnd : job.blocks;
+            if (block < end) high = middle;
+            else low = middle + 1;
+        }
+        slot = low;
+        if (slot) {
+            const auto& previous = jobs[slot - 1];
+            local = stage == 2 ? previous.windowsEnd : stage == 6 ? previous.bodyEnd : stage == 7 ? previous.onsetEnd : previous.blocks;
+        }
+        local = block - local;
+    }
+    const auto& job = jobs[slot];
+    switch (stage) {
+#if CLAY_FLOAT_OUTPUT
+    case 0: finishScanStereo(job.job, 1, static_cast<const float2*>(job.mix), job.stereo, local); break;
+    case 1: finishSelectNative(job.job, 1, static_cast<const float2*>(job.mix), job.stereo, job.result, 0); break;
+    case 2: finishQuantizeMono(job.job, 1, static_cast<const float2*>(job.mix), job.result, job.mono, job.windows, tail.window, local); break;
+    case 3: finishSelectTrim(job.job, 1, job.windows, job.result, tail, 0); break;
+#endif
+    case 11:
+        *job.summary = *job.result;
+        job.summary->offset = job.outputOffset;
+        break;
+    case 4: finishLayoutPcm(job.job, 1, job.result); break;
+    case 5: finishFinalizePcm(job.job, 1, job.mono, job.packed, job.result, local); break;
+#if CLAY_AUDIO_QA || CLAY_GROUP_VOLUME
+    case 6: finishMeasureBody(job.audio, 1, job.packed, job.result, job.bodyPower, audio, local); break;
+#if CLAY_AUDIO_QA
+    case 7: finishMeasureOnsets(job.audio, 1, job.onsets, job.packed, job.result, job.onsetPower, audio.window, local); break;
+#endif
+    case 8: finishSummarizeAudio(job.audio, 1, job.bodyPower, job.onsetPower, job.result, audio, 0); break;
+    case 9: finishLayoutAccepted(job.job, 1, job.result, job.pcm); break;
+    case 10: finishPackAccepted(job.pcm, 1, job.packed, job.output, job.result, local); break;
+#endif
+    }
+}
+
+extern "C" __global__ void scheduledPackLayout(FinishJob* jobs, int count, short* output)
+{
+    unsigned long long offset = 0;
+    constexpr int channels = CLAY_FLOAT_OUTPUT ? 1 : 2;
+    for (int i = 0; i < count; ++i) {
+        jobs[i].outputOffset = offset;
+        jobs[i].output = output + offset * channels;
+#if !CLAY_AUDIO_QA && !CLAY_GROUP_VOLUME
+        jobs[i].packed = jobs[i].output;
+#endif
+        offset += jobs[i].result->dataFrames;
+    }
+}
