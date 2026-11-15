@@ -134,3 +134,12 @@ The audit uses the host-only ClaySampler loader and the sfizz C API on the same 
 python tests/audit_presets.py --clay build/claysampler --sfizz-library path/to/sfizz.dll \
   --root path/to/instruments --pattern '*/*/presets/*.sfz' --output build/sfz-audit.json
 ```
+
+
+## Dynamic synthesis segments
+
+On the RTX 4080 Laptop GPU, 256 saved pending v4-175 jobs completed with 202 accepted WAVs and exit status 2. Other outcomes were 44 quiet-performance rejections, eight peak rejections, one excessive-silence rejection, and one unsupported MIDI-message rejection. The previously failing cowsynth/MIDI pair reached the peak check, and 92 later jobs produced WAVs. Its six-job batch used ten segments with up to 3,219,520,736 bytes of reusable synthesis scratch, compared with 31,195,703,712 bytes for the full filter/pitch workload. Pass time was 35.36 seconds, including preparation and writing. v0.1.1 cannot complete this workload, so this replay measures recovery and continuation.
+
+A separate fixed set of 64 real jobs was prepared once and run in baseline, dynamic, dynamic, baseline order. Each invocation used three passes, CPU limit 64, and GPU limit 32. All 54 accepted WAVs matched v0.1.1 byte for byte. Median warm pass times were 3.908 seconds for v0.1.1 and 3.912 seconds for the dynamic build, approximately equal warm throughput. Device-wide GPU utilization sampled every 200 ms averaged approximately 75.6% for baseline invocations and 78.7% for dynamic invocations. The short device-wide sample is insufficient to attribute that difference to scheduling or establish an overall speedup.
+
+Tail and group-audio regressions passed. An isolated build with synthesis scratch limited to 64 KiB forced multiple segments in `tests/check_segments.py --require-segments`. Held notes, pedal release, CC-driven filters, pitch modulation, natural mono, and original stereo output matched the baseline byte for byte. Group-volume tests passed with that forced budget. Another isolated build injected device and mapped-host allocation failures for the second job. Independent and grouped runs rejected only that job, reported output/MIDI/SFZ/bytes, completed the other three jobs, and returned status 2 across two passes. Injection code was confined to temporary builds.

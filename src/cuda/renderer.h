@@ -13,6 +13,7 @@ struct RenderBatch {
     std::shared_ptr<int16_t> pcm;
     std::vector<TailResult> results;
     double kernelSeconds = 0;
+    size_t failedScratchBytes = 0; // Single rejected job at the published index.
 };
 
 class Renderer {

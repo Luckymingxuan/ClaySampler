@@ -194,26 +194,26 @@ __device__ float jobGain(const ControlPoint* controls, const int* offsets, int f
 
 extern "C" __global__ void renderFilterSources(const float* samples, const float* sinc, const VoiceSpan* voices,
     const FilterTile* tiles, const ControlPoint* controls, const VoiceModulation* modulation,
-    const double* phase, float* filtered, int firstTile)
+    const double* phase, float* filtered, int segmentFirst, int segmentEnd, int segmentFrames, int firstTile)
 {
     const auto tile = tiles[firstTile + blockIdx.x];
     const auto& voice = voices[tile.span];
     const auto frame = tile.frame + int(threadIdx.x);
-    if (frame >= voice.end)
+    if (frame >= voice.end || frame < segmentFirst || frame >= segmentEnd)
         return;
     const auto* offsets = voice.filterControls;
-    const auto position = voice.variablePitch ? phase[voice.phaseOffset + frame - voice.begin] : -1;
+    const auto position = voice.variablePitch ? phase[voice.phaseOffset + (frame - max(voice.begin, segmentFirst))] : -1;
     auto sample = voiceAudio(samples, sinc, voice, controls, modulation,
         controlAt(controls, offsets[2], offsets[3], frame), frame, true, position);
     const auto gain = jobGain(controls, offsets, frame);
-    auto* destination = filtered + voice.filteredOffset + (frame - voice.begin) * voice.channels;
+    auto* destination = filtered + voice.filteredOffset + (frame - max(voice.begin, segmentFirst)) * voice.channels;
     destination[0] = sample.x * gain;
     if (voice.channels == 2)
         destination[1] = sample.y * gain;
 }
 
 extern "C" __global__ void prepareVoicePitch(const VoiceSpan* voices, const int* heads,
-    const ControlPoint* controls, const VoiceModulation* modulation, double* phase, int count)
+    const ControlPoint* controls, const VoiceModulation* modulation, double* phase, VoiceState* states, int segmentFirst, int segmentEnd, int segmentFrames, int count)
 {
     const auto track = int(blockIdx.x * blockDim.x + threadIdx.x);
     if (track >= count)
@@ -221,19 +221,23 @@ extern "C" __global__ void prepareVoicePitch(const VoiceSpan* voices, const int*
     const auto head = heads[track];
     if (!voices[head].variablePitch)
         return;
-    auto position = voices[head].position;
-    int previousLoopEnd = 0, previousLoopStart = 0;
+    auto& state = states[head];
+    auto position = state.pitchInitialized ? state.position : voices[head].position;
+    int previousLoopEnd = state.previousLoopEnd, previousLoopStart = state.previousLoopStart;
     for (int span = head; span >= 0; span = voices[span].nextFilteredSpan) {
         const auto& voice = voices[span];
-        if (!voice.loopEnd && previousLoopEnd > 0 && position >= previousLoopEnd)
+        if (voice.end <= segmentFirst || voice.begin >= segmentEnd)
+            continue;
+        const bool resumed = state.pitchInitialized && state.pitchSpan == span;
+        if (!resumed && !voice.loopEnd && previousLoopEnd > 0 && position >= previousLoopEnd)
             position = previousLoopStart + fmod(position - previousLoopStart,
                 double(previousLoopEnd - previousLoopStart));
         previousLoopEnd = voice.loopEnd;
         previousLoopStart = voice.loopFirst;
         const auto slope = exp(voice.pitchSlope);
-        auto step = voice.step;
-        for (int frame = voice.begin; frame < voice.end; ++frame) {
-            phase[voice.phaseOffset + frame - voice.begin] = position;
+        auto step = resumed ? state.step : voice.step;
+        for (int frame = max(voice.begin, segmentFirst); frame < min(voice.end, segmentEnd); ++frame) {
+            phase[voice.phaseOffset + (frame - max(voice.begin, segmentFirst))] = position;
             float cents = 0;
             auto depth = voice.extraEnvelope[1].depth;
             for (int j = voice.firstModulation; j < voice.firstModulation + voice.modulationCount; ++j) {
@@ -248,12 +252,16 @@ extern "C" __global__ void prepareVoicePitch(const VoiceSpan* voices, const int*
             position += step * exp2f(fminf(24000, fmaxf(-24000, cents)) / 1200);
             step *= slope;
         }
+        state.pitchInitialized = true;
+        state.pitchSpan = span;
+        state.position = position;
+        state.step = step;
+        state.previousLoopEnd = previousLoopEnd;
+        state.previousLoopStart = previousLoopStart;
     }
 }
 
-struct Coefficients {
-    float b0, b1, b2, a1, a2;
-};
+using Coefficients = FilterCoefficients;
 
 __device__ Coefficients coefficients(FilterType type, float cutoff, float resonance, int rate,
                                      float bandwidth, float gain)
@@ -316,7 +324,7 @@ __device__ float filterSample(float x, const Coefficients& c, float& z1, float& 
 }
 
 extern "C" __global__ void applyVoiceFilters(const VoiceSpan* voices, const int* heads,
-    const ControlPoint* controls, const VoiceModulation* modulation, float* filtered, int count)
+    const ControlPoint* controls, const VoiceModulation* modulation, float* filtered, VoiceState* states, int segmentFirst, int segmentEnd, int segmentFrames, int count)
 {
     const auto track = int(blockIdx.x * blockDim.x + threadIdx.x);
     if (track >= count)
@@ -327,9 +335,19 @@ extern "C" __global__ void applyVoiceFilters(const VoiceSpan* voices, const int*
     if (!hasFilters) return;
     float2 z1[voiceFilterSlots][3]{}, z2[voiceFilterSlots][3]{};
     Coefficients current[voiceFilterSlots]{};
-    bool initialized = false;
+    auto& state = states[heads[track]];
+    bool initialized = state.filterInitialized;
+    for (int f = 0; f < voiceFilterSlots; ++f) {
+        current[f] = state.coefficients[f];
+        for (int j = 0; j < 3; ++j) {
+            z1[f][j] = make_float2(state.z1[f][j][0], state.z1[f][j][1]);
+            z2[f][j] = make_float2(state.z2[f][j][0], state.z2[f][j][1]);
+        }
+    }
     for (int span = heads[track]; span >= 0; span = voices[span].nextFilteredSpan) {
         const auto& voice = voices[span];
+        if (voice.end <= segmentFirst || voice.begin >= segmentEnd)
+            continue;
         const auto rate = voice.sampleRate;
         const auto amount = 1 - expf(-1000.f / rate);
         int count[voiceFilterSlots];
@@ -346,7 +364,7 @@ extern "C" __global__ void applyVoiceFilters(const VoiceSpan* voices, const int*
             moving |= (target >= ModTarget::cutoff && target <= ModTarget::resonance2) ||
                 target == ModTarget::filterEnvDepth || target >= ModTarget::eq1Frequency;
         }
-        for (int frame = voice.begin; frame < voice.end; ++frame) {
+        for (int frame = max(voice.begin, segmentFirst); frame < min(voice.end, segmentEnd); ++frame) {
             if (moving || !initialized) {
                 float cents[2]{}, db[2]{};
                 float eq[3][3]{};
@@ -378,23 +396,20 @@ extern "C" __global__ void applyVoiceFilters(const VoiceSpan* voices, const int*
                 }
                 initialized = true;
             }
-            auto* sample = filtered + voice.filteredOffset + (frame - voice.begin) * voice.channels;
+            auto* sample = filtered + voice.filteredOffset + (frame - max(voice.begin, segmentFirst)) * voice.channels;
             if (!moving && sectionCount == 1) {
                 const auto coeff = current[firstSlot];
                 auto first = z1[firstSlot][0], second = z2[firstSlot][0];
-                // Keep the recurrence in registers for a static single-section filter.
-                if (voice.channels == 1) {
-                    for (int i = frame; i < voice.end; ++i, ++sample)
-                        *sample = filterSample(*sample, coeff, first.x, second.x);
-                } else {
-                    for (int i = frame; i < voice.end; ++i, sample += 2) {
-                        sample[0] = filterSample(sample[0], coeff, first.x, second.x);
+                const auto end = min(voice.end, segmentEnd);
+                for (int i = frame; i < end; ++i, sample += voice.channels) {
+                    sample[0] = filterSample(sample[0], coeff, first.x, second.x);
+                    if (voice.channels == 2)
                         sample[1] = filterSample(sample[1], coeff, first.y, second.y);
-                    }
                 }
                 z1[firstSlot][0] = first;
                 z2[firstSlot][0] = second;
-                break;
+                frame = end - 1;
+                continue;
             }
             auto left = sample[0];
             auto right = voice.channels == 2 ? sample[1] : 0.f;
@@ -410,11 +425,22 @@ extern "C" __global__ void applyVoiceFilters(const VoiceSpan* voices, const int*
                 sample[1] = right;
         }
     }
+    state.filterInitialized = initialized;
+    for (int f = 0; f < voiceFilterSlots; ++f) {
+        state.coefficients[f] = current[f];
+        for (int j = 0; j < 3; ++j) {
+            state.z1[f][j][0] = z1[f][j].x;
+            state.z1[f][j][1] = z1[f][j].y;
+            state.z2[f][j][0] = z2[f][j].x;
+            state.z2[f][j][1] = z2[f][j].y;
+        }
+    }
+
 }
 
 __device__ float2 mixFrame(const float* samples, const float* sinc, const VoiceSpan* voices,
                           const Tile& tile, const int* indices, const ControlPoint* controls,
-                          const VoiceModulation* modulation, const float* filtered, int frame)
+                          const VoiceModulation* modulation, const float* filtered, int frame, int segmentFirst)
 {
     const auto pan = controlAt(controls, tile.controls[2], tile.controls[3], frame);
     float left = 0, right = 0, wetLeft = 0, wetRight = 0;
@@ -423,7 +449,7 @@ __device__ float2 mixFrame(const float* samples, const float* sinc, const VoiceS
         if (frame < voice.begin || frame >= voice.end)
             continue;
         if (voice.filterTrack >= 0) {
-            const auto* source = filtered + voice.filteredOffset + (frame - voice.begin) * voice.channels;
+            const auto* source = filtered + voice.filteredOffset + (frame - max(voice.begin, segmentFirst)) * voice.channels;
             auto sample = make_float2(source[0], voice.channels == 1 ? source[0] : source[1]);
             if (voice.channels == 1) {
                 auto offset = pan;
@@ -457,13 +483,13 @@ using OutputFrame = short2;
 extern "C" __global__ void renderTiles(const float* samples, const float* sinc, const VoiceSpan* voices,
                                       const Tile* tiles, const int* indices, const ControlPoint* controls,
                                       const VoiceModulation* modulation, const float* filtered,
-                                      OutputFrame* output, int firstTile)
+                                      OutputFrame* output, int segmentFirst, int segmentEnd, int segmentFrames, int firstTile)
 {
     const Tile tile = tiles[firstTile + blockIdx.x];
     const auto lane = int(threadIdx.x);
-    if (lane >= tile.frames)
+    if (lane >= tile.frames || tile.frame + lane < segmentFirst || tile.frame + lane >= segmentEnd)
         return;
-    const auto mixed = mixFrame(samples, sinc, voices, tile, indices, controls, modulation, filtered, tile.frame + lane);
+    const auto mixed = mixFrame(samples, sinc, voices, tile, indices, controls, modulation, filtered, tile.frame + lane, segmentFirst);
 #if CLAY_FLOAT_OUTPUT
     output[tile.output + lane] = mixed;
 #else

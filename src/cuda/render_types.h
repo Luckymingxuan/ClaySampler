@@ -15,6 +15,18 @@ enum class FilterType { none, low1, high1, low2, high2, band2, notch2, low4, hig
 enum class Generator { none, sine, silence, noise };
 constexpr int voiceFilterSlots = 5;
 
+struct FilterCoefficients {
+    float b0, b1, b2, a1, a2;
+};
+
+struct VoiceState {
+    double position, step;
+    int pitchSpan, previousLoopEnd, previousLoopStart;
+    bool pitchInitialized, filterInitialized;
+    float z1[voiceFilterSlots][3][2], z2[voiceFilterSlots][3][2];
+    FilterCoefficients coefficients[voiceFilterSlots];
+};
+
 struct VoiceFilter {
     FilterType type;
     float cutoff, resonance, bandwidth, gain;
@@ -92,7 +104,7 @@ struct TailConfig {
 
 enum class TailStatus {
     ok, duration, nonfinite, peak, audioDuration, quietPerformance, excessiveSilence,
-    silentAudio, clipping, silentBody, incompleteGroup
+    silentAudio, clipping, silentBody, incompleteGroup, scratchMemory
 };
 
 struct AudioConfig {

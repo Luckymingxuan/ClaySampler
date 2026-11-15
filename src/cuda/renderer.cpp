@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <string_view>
@@ -571,7 +572,7 @@ struct Renderer::Impl {
         }
         if (!samples.address && bytes > mappedSamples.capacity) {
             mappedSamples.reset();
-            sampleData = mapHost(mappedSamples, bytes, "CUDA mapped sample bank");
+            driver.check(tryMapHost(mappedSamples, bytes, sampleData), "CUDA mapped sample bank");
             uploaded = 0;
         }
         if (bytes > uploaded) {
@@ -587,19 +588,29 @@ struct Renderer::Impl {
         recordPeak();
     }
 
-    DevicePtr mapHost(HostPcm& buffer, size_t bytes, const char* operation)
+    int tryMapHost(HostPcm& buffer, size_t bytes, DevicePtr& address)
     {
         constexpr unsigned deviceMap = 2; // CU_MEMHOSTALLOC_DEVICEMAP
-        driver.check(driver.allocMapped(&buffer.address, bytes, deviceMap), operation);
-        DevicePtr address{};
-        driver.check(driver.mappedAddress(&address, buffer.address, 0), operation);
+        void* host{};
+        if (const auto status = driver.allocMapped(&host, bytes, deviceMap))
+            return status;
+        buffer.address = host;
+        DevicePtr mapped{};
+        if (const auto status = driver.mappedAddress(&mapped, host, 0)) {
+            buffer.reset();
+            return status;
+        }
         buffer.capacity = bytes;
-        return address;
+        address = mapped;
+        return 0;
     }
 
     DevicePtr mapScratch(size_t bytes)
     {
-        mappedBase = mapHost(mappedScratch, bytes, "CUDA mapped scratch allocation");
+        const auto status = tryMapHost(mappedScratch, bytes, mappedBase);
+        if (status == cudaOutOfMemory)
+            return 0;
+        driver.check(status, "CUDA mapped scratch allocation");
         return mappedBase;
     }
 
@@ -676,7 +687,8 @@ struct Renderer::Impl {
     }
 
     void launchRecurrences(Handle function, int count, DevicePtr voices, DevicePtr heads,
-                           DevicePtr controls, DevicePtr modulation, DevicePtr scratch)
+                           DevicePtr controls, DevicePtr modulation, DevicePtr scratch, DevicePtr states,
+                           int segmentFirst, int segmentEnd, int segmentFrames)
     {
         if (!count)
             return;
@@ -684,7 +696,8 @@ struct Renderer::Impl {
         // across SMs, then fill warps as the number of independent tracks grows.
         const int blocks = 2 * multiprocessors;
         const int width = std::clamp(1 + (count - 1) / blocks, 1, 32);
-        void* args[] = {&voices, &heads, &controls, &modulation, &scratch, &count};
+        void* args[] = {&voices, &heads, &controls, &modulation, &scratch, &states,
+                        &segmentFirst, &segmentEnd, &segmentFrames, &count};
         driver.check(driver.launch(function, 1 + (count - 1) / width, 1, 1,
             width, 1, 1, 0, nullptr, args, nullptr), "CUDA voice recurrence launch");
     }
@@ -693,6 +706,7 @@ struct Renderer::Impl {
         std::vector<TailJob> jobs;
         DevicePtr jobData{}, resultData{}, source{}, output{}, pcmJobs{};
         int blocks{};
+        size_t failedScratchBytes{};
     };
 
     int channels() const { return natural ? 1 : 2; }
@@ -733,22 +747,23 @@ struct Renderer::Impl {
         bytes += plan.filterTracks * 2 * sizeof(int);
         for (const auto& track : plan.controls)
             bytes += track.size() * sizeof(ControlPoint);
-        return bytes + plan.modulation.size() * sizeof(VoiceModulation) + std::max(finishing, filtering);
+        return bytes + plan.modulation.size() * sizeof(VoiceModulation) + std::max(finishing, std::min(filtering, size_t{64} * 1024 * 1024));
     }
 
     Synthesis synthesize(const std::vector<RenderPlan>& plans, size_t first, size_t stop, const TimingEvent& begin,
                          const std::vector<size_t>& sizes = {})
     {
         size_t maxJobs = batchJobs;
+        size_t scratchLimit = std::numeric_limits<size_t>::max();
         for (;;) {
-            auto work = trySynthesize(plans, first, stop, begin, sizes, maxJobs);
+            auto work = trySynthesize(plans, first, stop, begin, sizes, maxJobs, scratchLimit);
             if (!work.jobs.empty())
                 return work;
         }
     }
 
     Synthesis trySynthesize(const std::vector<RenderPlan>& plans, size_t first, size_t stop, const TimingEvent& begin,
-                            const std::vector<size_t>& sizes, size_t& maxJobs)
+                            const std::vector<size_t>& sizes, size_t& maxJobs, size_t& scratchLimit)
     {
         const auto frameBytes = 2 * (natural ? sizeof(float) : sizeof(int16_t));
         size_t free{}, total{};
@@ -797,6 +812,7 @@ struct Renderer::Impl {
             blocks += jobBlocks;
             windows += jobWindows;
         }
+        std::vector<VoiceState> states(index.voices.size());
         int count = static_cast<int>(jobs.size());
         ArenaLayout layout;
         const auto reserve = [&](const auto& items) { return layout.section(items.size() * sizeof(items.front())); };
@@ -805,6 +821,7 @@ struct Renderer::Impl {
         const auto filterTileOffset = reserve(index.filterTiles), filterHeadOffset = reserve(index.filterHeads);
         const auto pitchHeadOffset = reserve(index.pitchHeads);
         const auto jobOffset = reserve(jobs), audioOffset = reserve(audioJobs), onsetOffset = reserve(onsets);
+        const auto stateOffset = reserve(states);
         const auto mixOffset = layout.section(index.frames * frameBytes);
         const auto resultOffset = layout.section(count * sizeof(TailResult));
         // Once the mix kernel finishes, PCM and quality buffers can reuse filter and pitch scratch.
@@ -817,28 +834,130 @@ struct Renderer::Impl {
         const auto onsetPowerOffset = finishing.section(onsets.size() * sizeof(unsigned long long));
         const auto pcmJobOffset = finishing.section(assess ? jobs.size() * sizeof(PcmJob) : 0);
         const auto stereoOutput = finishing.section(assess && !natural ? index.frames * frameBytes : 0);
-        ArenaLayout filtering;
-        const auto filteredBytes = index.filteredSamples * sizeof(float);
-        filtering.section(filteredBytes);
-        const auto phaseOffset = filtering.section(index.pitchFrames * sizeof(double));
-        const auto bytes = scratchOffset + std::max(finishing.bytes, filtering.bytes);
+        // Reserve the mix, metadata, and finishing buffers before budgeting reusable synthesis scratch.
+        const auto fixedBytes = scratchOffset + finishing.bytes;
+        const auto usable = available - available / 8;
+        const auto scratchBudget = std::min(scratchLimit, std::max(size_t{1024} * 1024,
+            usable > fixedBytes ? std::min(budget, usable - scratchOffset) : size_t{0}));
+        struct Activity { int frame, channels, pitch; };
+        struct Usage { int frame; size_t samples, phases; int channels, pitch; };
+        struct Segment { int first, end; size_t samples, phases; };
+        std::vector<Activity> activity;
+        std::vector<Usage> usage{{0, 0, 0, 0, 0}};
+        int lastFrame = 0;
+        for (const auto& job : jobs)
+            lastFrame = std::max(lastFrame, job.frames);
+        const auto fullFilterBytes = index.filteredSamples * sizeof(float);
+        const auto fullPhaseOffset = (fullFilterBytes + 15) & ~size_t{15};
+        const auto fullScratchBytes = fullPhaseOffset + index.pitchFrames * sizeof(double);
+        if (fullScratchBytes > scratchBudget) {
+            for (const auto& voice : index.voices) {
+                if (voice.filterTrack < 0)
+                    continue;
+                activity.push_back({voice.begin, voice.channels, voice.variablePitch});
+                activity.push_back({voice.end, -voice.channels, -voice.variablePitch});
+            }
+            std::sort(activity.begin(), activity.end(), [](const auto& a, const auto& b) { return a.frame < b.frame; });
+            for (size_t i = 0; i < activity.size();) {
+                auto point = usage.back();
+                const auto frame = activity[i].frame;
+                point.samples += size_t(frame - point.frame) * point.channels;
+                point.phases += size_t(frame - point.frame) * point.pitch;
+                point.frame = frame;
+                do {
+                    point.channels += activity[i].channels;
+                    point.pitch += activity[i].pitch;
+                    ++i;
+                } while (i < activity.size() && activity[i].frame == frame);
+                usage.push_back(point);
+            }
+        }
+        const auto usageAt = [&](int frame) {
+            auto point = *std::prev(std::upper_bound(usage.begin(), usage.end(), frame,
+                [](int frame, const auto& point) { return frame < point.frame; }));
+            point.samples += size_t(frame - point.frame) * point.channels;
+            point.phases += size_t(frame - point.frame) * point.pitch;
+            return point;
+        };
+        std::vector<Segment> segments;
+        size_t filterBytes = 0;
+        for (int firstFrame = 0; firstFrame < lastFrame;) {
+            if (fullScratchBytes <= scratchBudget) {
+                segments.push_back({0, lastFrame, index.filteredSamples, index.pitchFrames});
+                filterBytes = fullScratchBytes;
+                break;
+            }
+            const auto firstUsage = usageAt(firstFrame);
+            const auto fits = [&](int end) {
+                const auto last = usageAt(end);
+                const auto bytes = ((last.samples - firstUsage.samples) * sizeof(float) + 15) & ~size_t{15};
+                return bytes <= scratchBudget && (last.phases - firstUsage.phases) * sizeof(double) <= scratchBudget - bytes;
+            };
+            int low = firstFrame, high = lastFrame;
+            while (low < high) {
+                const auto middle = low + (high - low + 1) / 2;
+                if (fits(middle)) low = middle;
+                else high = middle - 1;
+            }
+            // If even one frame cannot fit, use allocation recovery without constructing one segment per frame.
+            const auto end = low == firstFrame ? lastFrame : low;
+            const auto last = usageAt(end);
+            Segment segment{firstFrame, end, last.samples - firstUsage.samples, last.phases - firstUsage.phases};
+            const auto bytes = ((segment.samples * sizeof(float) + 15) & ~size_t{15}) + segment.phases * sizeof(double);
+            filterBytes = std::max(filterBytes, bytes);
+            segments.push_back(segment);
+            firstFrame = end;
+        }
+        const bool segmented = segments.size() > 1;
+        if (segmented) {
+            std::cerr << "SEGMENT\tfirst=" << first << "\tjobs=" << jobs.size()
+                      << "\tcount=" << segments.size() << "\tscratch_bytes=" << filterBytes
+                      << "\tfull_scratch_bytes=" << fullScratchBytes << '\n';
+            std::sort(index.tiles.begin(), index.tiles.end(), [](const auto& a, const auto& b) { return a.frame < b.frame; });
+            std::sort(index.filterTiles.begin(), index.filterTiles.end(),
+                [](const auto& a, const auto& b) { return a.frame < b.frame; });
+        }
+        const auto bytes = scratchOffset + std::max(finishing.bytes, filterBytes);
         auto allocation = arena.tryAllocate(bytes);
+        if (allocation == cudaOutOfMemory && filterBytes > std::max(finishing.bytes, size_t{2} * 1024 * 1024)) {
+            scratchLimit = filterBytes / 2;
+            return {};
+        }
         if (allocation == cudaOutOfMemory && jobs.size() > 1) {
             // Destroy the failed batch's host metadata before assembling a smaller one.
             maxJobs = jobs.size() / 2;
             return {};
         }
+        if (allocation == cudaOutOfMemory) {
+            std::cerr << "MEMORY\tjob=" << first << "\trequested_bytes=" << bytes
+                      << "\tmix_bytes=" << index.frames * frameBytes
+                      << "\tfilter_bytes=" << filterBytes
+                      << "\tpitch_bytes=" << index.pitchFrames * sizeof(double)
+                      << "\tfinishing_bytes=" << finishing.bytes
+                      << "\tmetadata_bytes=" << scratchOffset - index.frames * frameBytes
+                      << "\tsample_bytes=" << uploaded
+                      << "\tfree_device_bytes=" << free << '\n';
+        }
         DevicePtr filterScratch{};
-        if (allocation == cudaOutOfMemory && filtering.bytes > finishing.bytes) {
+        if (allocation == cudaOutOfMemory && filterBytes > finishing.bytes) {
             // Filter and pitch scratch account for most of a dense job's memory.
             // Kernels can access it directly in host memory while the mix stays on the device.
             allocation = arena.tryAllocate(scratchOffset + finishing.bytes);
-            if (!allocation)
-                filterScratch = mapScratch(filtering.bytes);
+            if (!allocation) {
+                filterScratch = mapScratch(filterBytes);
+                if (!filterScratch) {
+                    synthesis.failedScratchBytes = filterBytes;
+                    return synthesis;
+                }
+            }
         }
         if (allocation != cudaOutOfMemory)
             driver.check(allocation, "CUDA synthesis scratch allocation");
         const auto base = allocation == cudaOutOfMemory ? mapScratch(bytes) : arena.address;
+        if (!base) {
+            synthesis.failedScratchBytes = bytes;
+            return synthesis;
+        }
         const auto finishScratch = base + scratchOffset;
         if (!filterScratch)
             filterScratch = finishScratch;
@@ -849,27 +968,83 @@ struct Renderer::Impl {
                 uploadScratch(address, items.data(), items.size() * sizeof(items.front()), "CUDA batch upload");
             return address;
         };
-        auto voices = upload(voiceOffset, index.voices), tiles = upload(tileOffset, index.tiles);
+        auto voices = upload(voiceOffset, index.voices);
+        auto tiles = base + tileOffset;
+        auto stateData = upload(stateOffset, states);
         auto indices = upload(indexOffset, index.indices), controls = upload(controlOffset, index.controls);
         auto modulation = upload(modulationOffset, index.modulation), jobData = upload(jobOffset, jobs);
-        auto filterTiles = upload(filterTileOffset, index.filterTiles), filterHeads = upload(filterHeadOffset, index.filterHeads);
+        auto filterTiles = base + filterTileOffset;
+        auto filterHeads = upload(filterHeadOffset, index.filterHeads);
         auto pitchHeads = upload(pitchHeadOffset, index.pitchHeads);
         auto filtered = filterScratch;
-        auto phase = filtered + phaseOffset;
+
         auto mix = base + mixOffset, resultData = base + resultOffset;
         auto mono = natural ? finishScratch + monoOffset : mix;
         // After mono conversion the float mix is dead, so its allocation also holds the compact PCM.
         auto packed = mix;
         auto assessment = upload(audioOffset, audioJobs), starts = upload(onsetOffset, onsets);
         begin.record();
-        if (index.filteredSamples) {
-            launchRecurrences(pitchPass, int(index.pitchHeads.size()), voices, pitchHeads, controls, modulation, phase);
-            launchChunks(filterSource, int(index.filterTiles.size()), threads, sampleData, sinc.address,
-                voices, filterTiles, controls, modulation, phase, filtered);
-            launchRecurrences(filterPass, int(index.filterHeads.size()), voices, filterHeads, controls, modulation, filtered);
+        for (const auto& segment : segments) {
+            auto segmentFirst = segment.first, segmentEnd = segment.end;
+            auto segmentFrames = segmentEnd - segmentFirst;
+            auto phase = filtered + ((segment.samples * sizeof(float) + 15) & ~size_t{15});
+            size_t filteredOffset = 0, pitchOffset = 0;
+            for (auto& voice : index.voices) {
+                if (voice.filterTrack < 0)
+                    continue;
+                const auto frames = std::max(0, std::min(voice.end, segmentEnd) - std::max(voice.begin, segmentFirst));
+                voice.filteredOffset = filteredOffset;
+                filteredOffset += size_t(frames) * voice.channels;
+                voice.phaseOffset = pitchOffset;
+                if (voice.variablePitch)
+                    pitchOffset += frames;
+            }
+            if (index.filteredSamples && segmented)
+                uploadScratch(voices, index.voices.data(), index.voices.size() * sizeof(VoiceSpan), "CUDA segment voices");
+            const auto activeHeads = [&](const auto& heads, DevicePtr destination) {
+                if (!segmented)
+                    return int(heads.size());
+                std::vector<int> active;
+                for (auto head : heads) {
+                    for (int span = head; span >= 0; span = index.voices[span].nextFilteredSpan) {
+                        const auto& voice = index.voices[span];
+                        if (voice.begin >= segmentEnd)
+                            break;
+                        if (voice.end > segmentFirst) {
+                            active.push_back(head);
+                            break;
+                        }
+                    }
+                }
+                if (!active.empty())
+                    uploadScratch(destination, active.data(), active.size() * sizeof(int), "CUDA active voice heads");
+                return int(active.size());
+            };
+            const auto pitchCount = activeHeads(index.pitchHeads, pitchHeads);
+            const auto filterCount = activeHeads(index.filterHeads, filterHeads);
+            const auto uploadTiles = [&](const auto& items, DevicePtr destination, int margin) {
+                const auto first = !segmented ? items.begin() : std::lower_bound(items.begin(), items.end(), segmentFirst - margin,
+                    [](const auto& item, int frame) { return item.frame < frame; });
+                const auto end = !segmented ? items.end() : std::lower_bound(first, items.end(), segmentEnd,
+                    [](const auto& item, int frame) { return item.frame < frame; });
+                const auto count = int(end - first);
+                if (count)
+                    uploadScratch(destination, &*first, size_t(count) * sizeof(*first), "CUDA segment tile upload");
+                return count;
+            };
+            if (index.filteredSamples) {
+                launchRecurrences(pitchPass, pitchCount, voices, pitchHeads, controls, modulation,
+                    phase, stateData, segmentFirst, segmentEnd, segmentFrames);
+                const auto count = uploadTiles(index.filterTiles, filterTiles, threads - 1);
+                launchChunks(filterSource, count, threads, sampleData, sinc.address,
+                    voices, filterTiles, controls, modulation, phase, filtered, segmentFirst, segmentEnd, segmentFrames);
+                launchRecurrences(filterPass, filterCount, voices, filterHeads, controls, modulation,
+                    filtered, stateData, segmentFirst, segmentEnd, segmentFrames);
+            }
+            const auto count = uploadTiles(index.tiles, tiles, threads - 1);
+            launchChunks(kernel, count, threads, sampleData, sinc.address, voices, tiles,
+                indices, controls, modulation, filtered, mix, segmentFirst, segmentEnd, segmentFrames);
         }
-        launchChunks(kernel, int(index.tiles.size()), threads, sampleData, sinc.address, voices, tiles,
-            indices, controls, modulation, filtered, mix);
         if (natural) {
             auto stats = finishScratch + statsOffset, windowStats = finishScratch + windowOffset;
             launchChunks(stereoScan, blocks, 128, jobData, count, mix, stats);
@@ -953,10 +1128,13 @@ struct Renderer::Impl {
     {
         TimingEvent begin(driver), end(driver);
         auto work = synthesize(plans, first, plans.size(), begin);
-        if (audio.enabled || groupMinimum)
+        if (work.failedScratchBytes)
+            return {{}, {}, 0, work.failedScratchBytes};
+        const bool assess = audio.enabled || groupMinimum;
+        if (assess)
             pack(work);
         end.record();
-        return download(work, audio.enabled || groupMinimum ? work.output : work.source, begin, end);
+        return download(work, assess ? work.output : work.source, begin, end);
     }
 
     struct Retained {
@@ -1002,21 +1180,68 @@ struct Renderer::Impl {
         return chunk;
     }
 
+    RenderBatch packRetained(Retained& chunk, DevicePtr resultData, size_t index = 0, const TailResult* single = nullptr)
+    {
+        const auto count = single ? size_t{1} : chunk.jobs.size();
+        const auto offset = single ? single->offset * channels() : 0;
+        const auto bytes = single ? single->dataFrames * channels() * sizeof(int16_t) : chunk.bytes;
+        ArenaLayout layout;
+        const auto jobBytes = count * sizeof(TailJob);
+        const auto jobOffset = layout.section(jobBytes);
+        const auto pcmOffset = layout.section(count * sizeof(PcmJob));
+        const auto sourceOffset = layout.section(chunk.host ? bytes : 0);
+        const auto outputOffset = layout.section(bytes);
+        const auto allocation = arena.tryAllocate(layout.bytes);
+        if (allocation != cudaOutOfMemory)
+            driver.check(allocation, "CUDA retained group scratch allocation");
+        else if (count > 1)
+            return {{}, {}, 0, layout.bytes};
+        const auto base = allocation == cudaOutOfMemory ? mapScratch(layout.bytes) : arena.address;
+        if (!base)
+            return {{}, {}, 0, layout.bytes};
+        recordPeak();
+        Synthesis work{{}, base + jobOffset, resultData,
+            chunk.device ? chunk.device->address + offset * sizeof(int16_t) : base + sourceOffset,
+            base + outputOffset, base + pcmOffset, chunk.blocks};
+        if (single) {
+            work.jobs.push_back(chunk.jobs[index]);
+            work.jobs.front().blockFirst = 0;
+            work.blocks = int(blocksFor(work.jobs.front().frames, tailBlockFrames));
+            auto rebased = *single;
+            rebased.offset = 0;
+            driver.check(driver.put(resultData, &rebased, sizeof(rebased)), "CUDA retained job metadata upload");
+        } else {
+            work.jobs = std::move(chunk.jobs);
+        }
+        uploadScratch(work.jobData, work.jobs.data(), jobBytes, "CUDA retained job upload");
+        if (chunk.host && bytes)
+            uploadScratch(work.source, chunk.host.get() + offset, bytes, "CUDA spilled PCM upload");
+        TimingEvent begin(driver), end(driver);
+        begin.record();
+        pack(work);
+        end.record();
+        return download(work, work.output, begin, end);
+    }
+
     size_t finishSplit(const std::vector<RenderPlan>& plans, const std::vector<size_t>& sizes, Synthesis work,
-                       const AudioGroup& group, DevicePtr groupData, DevicePtr resultData, const TimingEvent& firstBegin,
+                       const AudioGroup& group, DevicePtr groupData, DevicePtr resultData, const TimingEvent& begin,
                        const std::function<void(RenderBatch, size_t)>& publish)
     {
         std::vector<Retained> chunks;
-        TimingEvent firstEnd(driver);
-        auto next = group.first + work.jobs.size();
-        chunks.push_back(retain(work, group.first, resultData, firstEnd));
-        double synthSeconds = timing(firstBegin, firstEnd);
-        for (auto first = next; first < size_t(group.end); first = next) {
-            TimingEvent begin(driver), end(driver);
-            work = synthesize(plans, first, group.end, begin, sizes);
-            next = first + work.jobs.size();
+        TimingEvent end(driver);
+        double synthSeconds = 0;
+        for (size_t first = group.first;;) {
+            const auto next = first + work.jobs.size();
             const auto destination = resultData + (first - group.first) * sizeof(TailResult);
-            if (next == size_t(group.end)) {
+            const bool last = next == size_t(group.end);
+            if (work.failedScratchBytes) {
+                TailResult rejected{};
+                rejected.status = TailStatus::scratchMemory;
+                driver.check(driver.put(destination, &rejected, sizeof(rejected)), "CUDA rejected group job upload");
+                publish({{}, {}, 0, work.failedScratchBytes}, first);
+                if (last && !chunks.empty())
+                    match(groupData, 1, group.first, resultData);
+            } else if (last) {
                 copyScratch(destination, work.resultData, work.jobs.size() * sizeof(TailResult), "CUDA complete group metadata");
                 work.resultData = destination;
                 match(groupData, 1, group.first, resultData);
@@ -1024,45 +1249,49 @@ struct Renderer::Impl {
                 end.record();
                 auto batch = download(work, work.output, begin, end);
                 batch.kernelSeconds += synthSeconds;
+                synthSeconds = 0;
                 publish(std::move(batch), first);
-                break;
+            } else {
+                chunks.push_back(retain(work, first, destination, end));
+                synthSeconds += timing(begin, end);
             }
-            chunks.push_back(retain(work, first, destination, end));
-            synthSeconds += timing(begin, end);
+            if (last)
+                break;
+            first = next;
+            work = synthesize(plans, first, group.end, begin, sizes);
         }
-        // The last chunk can be packed directly. Only earlier chunks had to wait.
         for (auto& chunk : chunks) {
-            ArenaLayout layout;
-            const auto jobBytes = chunk.jobs.size() * sizeof(TailJob);
-            const auto jobOffset = layout.section(jobBytes);
-            const auto pcmOffset = layout.section(chunk.jobs.size() * sizeof(PcmJob));
-            const auto sourceOffset = layout.section(chunk.host ? chunk.bytes : 0);
-            const auto outputOffset = layout.section(chunk.bytes);
-            const auto allocation = arena.tryAllocate(layout.bytes);
-            if (allocation != cudaOutOfMemory)
-                driver.check(allocation, "CUDA retained group scratch allocation");
-            const auto base = allocation == cudaOutOfMemory ? mapScratch(layout.bytes) : arena.address;
-            recordPeak();
-            Synthesis work{std::move(chunk.jobs), base + jobOffset,
-                resultData + (chunk.first - group.first) * sizeof(TailResult),
-                chunk.device ? chunk.device->address : base + sourceOffset, base + outputOffset,
-                base + pcmOffset, chunk.blocks};
-            uploadScratch(work.jobData, work.jobs.data(), jobBytes, "CUDA retained job upload");
-            if (chunk.host)
-                uploadScratch(work.source, chunk.host.get(), chunk.bytes, "CUDA spilled PCM upload");
-            TimingEvent begin(driver), end(driver);
-            begin.record();
-            pack(work);
-            end.record();
-            auto batch = download(work, work.output, begin, end);
+            const auto sourceResults = resultData + (chunk.first - group.first) * sizeof(TailResult);
+            const auto publishChunk = [&](RenderBatch batch, size_t first) {
+                batch.kernelSeconds += synthSeconds;
+                synthSeconds = 0;
+                publish(std::move(batch), first);
+            };
+            auto batch = packRetained(chunk, sourceResults);
+            if (!batch.failedScratchBytes || chunk.jobs.size() == 1) {
+                publishChunk(std::move(batch), chunk.first);
+            } else {
+                // Retry the retained PCM one job at a time, using the matched gain already computed.
+                std::vector<TailResult> results(chunk.jobs.size());
+                driver.check(driver.get(results.data(), sourceResults, results.size() * sizeof(TailResult)),
+                    "CUDA retained job metadata download");
+                for (size_t i = 0; i < results.size(); ++i) {
+                    RenderBatch single;
+                    if (results[i].status == TailStatus::ok) {
+                        single = packRetained(chunk, sourceResults + i * sizeof(TailResult), i, &results[i]);
+                    } else {
+                        single.results.push_back(results[i]);
+                    }
+                    publishChunk(std::move(single), chunk.first + i);
+                }
+            }
             if (chunk.device) {
                 waiting -= chunk.bytes;
                 chunk.device.reset();
             }
             chunk.host.reset();
-            publish(std::move(batch), chunk.first);
         }
-        return next;
+        return group.end;
     }
 
     void renderWindow(const std::vector<RenderPlan>& plans, const std::function<void(RenderBatch, size_t)>& publish)
@@ -1082,7 +1311,7 @@ struct Renderer::Impl {
         if (groups.empty()) {
             for (size_t first = 0; first < plans.size();) {
                 auto batch = render(plans, first);
-                const auto next = first + batch.results.size();
+                const auto next = first + (batch.failedScratchBytes ? 1 : batch.results.size());
                 publish(std::move(batch), first);
                 first = next;
             }
@@ -1120,11 +1349,15 @@ struct Renderer::Impl {
                 ++group;
                 continue;
             }
-            if (group != groupStart)
-                match(groupData + groupStart * sizeof(AudioGroup), int(group - groupStart), int(first), work.resultData);
-            pack(work);
-            end.record();
-            publish(download(work, work.output, begin, end), first);
+            if (work.failedScratchBytes) {
+                publish({{}, {}, 0, work.failedScratchBytes}, first);
+            } else {
+                if (group != groupStart)
+                    match(groupData + groupStart * sizeof(AudioGroup), int(group - groupStart), int(first), work.resultData);
+                pack(work);
+                end.record();
+                publish(download(work, work.output, begin, end), first);
+            }
             first = next;
         }
     }

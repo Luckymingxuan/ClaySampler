@@ -25,7 +25,7 @@ Use `--nvrtc` and `--sndfile` for explicit library paths, or set `CLAY_NVRTC` an
 
 ClaySampler reuses compiled CUDA kernels across invocations. The per-user cache lives in `%LOCALAPPDATA%/ClaySampler/kernels` on Windows and `${XDG_CACHE_HOME:-$HOME/.cache}/claysampler/kernels` on Linux. A missing or unavailable cache triggers normal compilation.
 
-Successful jobs print `OK` and write PCM16 WAVs. Rejected MIDI jobs print `REJECT` with the input and reason. A batch containing rejected jobs returns exit status 2. A fatal setup error returns exit status 1.
+Successful jobs print `OK` and write PCM16 WAVs. Rejected jobs print `REJECT` with the input or output and reason. If a job exhausts CUDA-mapped host scratch after allocation retries, its rejection also includes the MIDI, SFZ, and requested bytes; remaining jobs continue. A batch containing only job-level failures returns exit status 2. Fatal setup or runtime errors return exit status 1.
 
 During batch rendering, the CPU plans the next group and writes completed WAVs while the GPU renders and finishes the current group. In `natural` mode, the GPU sends the finished mono PCM16 samples and output metadata to the host for WAV writing.
 
