@@ -16,6 +16,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -61,6 +62,9 @@ struct Options {
     std::vector<Path> midi;
     std::string quality = "off";
     std::map<std::string, Path> thresholds;
+    std::string outputFormat = "wav";
+    int flacLevel = 5;
+    bool resume = false;
     bool groupVolume = false;
     std::optional<int> groupMinimum, waitingMiB;
 };
@@ -103,11 +107,20 @@ Options arguments(int argc, Char** argv)
             options.midi.push_back(std::move(option));
             continue;
         }
+        if (name == "--resume") {
+            options.resume = true;
+            continue;
+        }
         if (i + 1 == argc)
             throw std::runtime_error("missing value for " + name);
         Path value(argv[++i]);
         if (name == "--sfz") options.sfz = value;
         else if (name == "--output") options.output = value;
+        else if (name == "--output-format") {
+            options.outputFormat = value.u8string();
+            if (options.outputFormat != "wav" && options.outputFormat != "flac")
+                throw std::runtime_error("expected --output-format wav or flac");
+        } else if (name == "--flac-level") options.flacLevel = integer(value, 0, 8);
         else if (name == "--jobs") options.jobs = value;
         else if (name == "--nvrtc") options.nvrtc = value;
         else if (name == "--sndfile") options.sndfile = value;
@@ -184,7 +197,7 @@ std::vector<Task> tasksFor(const Options& options)
     if (options.jobs.empty()) {
         for (const auto& path : options.midi) {
             auto name = path.stem();
-            name += ".wav";
+            name += "." + options.outputFormat;
             tasks.push_back({options.sfz, path, options.output / name});
         }
     } else {
@@ -206,14 +219,14 @@ std::vector<Task> tasksFor(const Options& options)
             std::istringstream row(line);
             for (auto& column : columns) {
                 if (!std::getline(row, column, '\t') || column.empty())
-                    throw std::runtime_error("expected group, SFZ, MIDI and WAV on manifest line " + std::to_string(lineNumber));
+                    throw std::runtime_error("expected group, SFZ, MIDI and output on manifest line " + std::to_string(lineNumber));
             }
             if (!row.eof() || line.find('\0') != std::string::npos)
                 throw std::runtime_error("invalid job manifest line " + std::to_string(lineNumber));
             Task task{root / std::filesystem::u8path(columns[1]), root / std::filesystem::u8path(columns[2]),
                       root / std::filesystem::u8path(columns[3])};
-            if (task.output.extension() != ".wav")
-                throw std::runtime_error("expected a .wav output on manifest line " + std::to_string(lineNumber));
+            if (task.output.extension() != "." + options.outputFormat)
+                throw std::runtime_error("expected a ." + options.outputFormat + " output on manifest line " + std::to_string(lineNumber));
             if (options.groupVolume && columns[0] != "-") {
                 const auto [group, inserted] = groupIndexes.emplace(columns[0], schedule.size());
                 if (inserted)
@@ -371,14 +384,15 @@ struct WrittenBatch {
     std::string ok, rejected;
 };
 
-WrittenBatch writeBatch(const clay::RenderBatch& batch, const std::vector<const Task*>& jobs, size_t first,
-                        int rate, int channels, bool manifest)
+WrittenBatch writeBatch(const clay::RenderBatch& batch, const std::vector<const Task*>& jobs, size_t begin,
+                        const Options& options, const clay::AudioBank& bank, int channels, bool manifest)
 {
+    const int rate = options.rate;
     std::ostringstream ok, rejected;
     size_t passed = 0;
-    for (size_t i = 0; i < batch.results.size(); ++i) {
-        const auto& result = batch.results[i];
-        const auto& path = jobs[first + i]->output;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        const auto& result = batch.results[begin + i];
+        const auto& path = jobs[i]->output;
         const auto& stats = result.audio;
         const auto* failure = tailError(result.status);
         if (stats.measured) {
@@ -394,7 +408,13 @@ WrittenBatch writeBatch(const clay::RenderBatch& batch, const std::vector<const 
                 throw std::runtime_error("rendered audio is silent " + path.u8string());
             if (manifest)
                 std::filesystem::create_directories(path.parent_path());
-            clay::writeWave(path, batch.pcm.get() + result.offset * channels, result.dataFrames, result.frames, rate, channels);
+            const auto* pcm = batch.pcm.get() + result.offset * channels;
+            clay::PendingOutput output(path);
+            if (options.outputFormat == "flac")
+                bank.writeFlac(output.path(), pcm, result.dataFrames, result.frames, rate, channels, options.flacLevel);
+            else
+                clay::writeWave(output.path(), pcm, result.dataFrames, result.frames, rate, channels);
+            output.publish();
             if (stats.gain > 0)
                 ok << "VOLUME\t" << path.u8string() << '\t' << stats.bodyRms << '\t' << stats.targetRms << '\t'
                    << 20 * std::log10(stats.gain) << '\n';
@@ -413,10 +433,27 @@ int run(const Options& options)
     const bool natural = options.tail == clay::TailPolicy::natural;
     const bool manifest = !options.jobs.empty();
     const int channels = natural ? 1 : 2;
+    const size_t lanes = options.outputFormat == "flac" ? std::clamp(std::thread::hardware_concurrency(), 1u, 3u) : 1;
     const auto audio = audioConfig(options);
-    const auto tasks = tasksFor(options);
+    auto tasks = tasksFor(options);
     auto start = Clock::now();
     clay::AudioBank bank(options.sndfile);
+    if (options.resume) {
+        std::vector<Task> pending;
+        for (size_t first = 0, end; first < tasks.size(); first = end) {
+            end = first + 1;
+            while (tasks[first].group && end < tasks.size() && tasks[end].group == tasks[first].group) ++end;
+            const bool complete = std::all_of(tasks.begin() + first, tasks.begin() + end, [&](const Task& task) {
+                return bank.completeOutput(task.output, options.outputFormat == "flac", options.rate, channels);
+            });
+            for (size_t i = first; i < end; ++i) {
+                if (complete) std::cout << "SKIP\t" << tasks[i].output.u8string() << '\n';
+                else pending.push_back(std::move(tasks[i]));
+            }
+        }
+        tasks = std::move(pending);
+        if (tasks.empty()) return 0;
+    }
     std::map<Path, clay::Instrument> instruments;
     const auto plan = [&](size_t first, size_t sampleBudget, bool fresh) {
         if (!manifest && instruments.empty())
@@ -498,16 +535,21 @@ int run(const Options& options)
                               << "\tSFZ=" << job.sfz.u8string() << '\n';
                     return;
                 }
-                if (writers.size() >= 3)
-                    drain();
-                std::vector<const Task*> jobs;
-                jobs.reserve(batch.results.size());
-                for (size_t i = 0; i < batch.results.size(); ++i)
-                    jobs.push_back((*group.jobs)[batch.jobIndices.empty() ? first + i : batch.jobIndices[i]]);
-                writers.push_back(std::async(std::launch::async,
-                    [batch = std::move(batch), jobs = std::move(jobs), rate = options.rate, channels, manifest] {
-                        return writeBatch(batch, jobs, 0, rate, channels, manifest);
-                    }));
+                auto finished = std::make_shared<clay::RenderBatch>(std::move(batch));
+                const size_t count = finished->results.size();
+                const size_t chunk = std::max<size_t>(4, (count + lanes - 1) / lanes);
+                for (size_t begin = 0; begin < count; begin += chunk) {
+                    if (writers.size() >= 3) drain();
+                    const size_t end = std::min(count, begin + chunk);
+                    std::vector<const Task*> jobs;
+                    jobs.reserve(end - begin);
+                    for (size_t i = begin; i < end; ++i)
+                        jobs.push_back((*group.jobs)[finished->jobIndices.empty() ? first + i : finished->jobIndices[i]]);
+                    writers.push_back(std::async(std::launch::async,
+                        [finished, jobs = std::move(jobs), begin, &options, &bank, channels, manifest] {
+                            return writeBatch(*finished, jobs, begin, options, bank, channels, manifest);
+                        }));
+                }
             }, refill);
             if (deferred) {
                 group = std::move(*deferred);
@@ -540,7 +582,8 @@ int main(int argc, char** argv)
         if (argc == 2 && Path(argv[1]) == "--help") {
             std::cout << "Usage: claysampler --sfz preset.sfz --output directory [options] file.mid ...\n"
                          "       claysampler --jobs tasks.tsv [options]\n"
-                         "Options: --samplerate Hz --device index --passes count --nvrtc path --sndfile path\n"
+                         "Options: --output-format wav|flac --flac-level 0..8 --resume\n"
+                         "         --samplerate Hz --device index --passes count --nvrtc path --sndfile path\n"
                          "         --cpu-batch-jobs count --gpu-batch-jobs count (default 64 each)\n"
                          "         --tail-policy natural|orig|custom (default natural)\n"
                          "         --max-audio-seconds seconds (natural)\n"
