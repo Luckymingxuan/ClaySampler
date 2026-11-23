@@ -24,6 +24,8 @@ public:
     int describe(const std::filesystem::path& path);
     const Sample& decode(int id);
     void releaseDecoded();
+    void writeFlac(const std::filesystem::path& path, const int16_t* pcm, int dataFrames, int frames,
+                   int rate, int channels, int level) const;
 
     std::vector<Sample> samples;
     std::vector<float> pcm;

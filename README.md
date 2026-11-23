@@ -25,9 +25,9 @@ Use `--nvrtc` and `--sndfile` for explicit library paths, or set `CLAY_NVRTC` an
 
 ClaySampler reuses compiled CUDA kernels across invocations. The per-user cache lives in `%LOCALAPPDATA%/ClaySampler/kernels` on Windows and `${XDG_CACHE_HOME:-$HOME/.cache}/claysampler/kernels` on Linux. A missing or unavailable cache triggers normal compilation.
 
-Successful jobs print `OK` and write PCM16 WAVs. Rejected jobs print `REJECT` with the input or output and reason. If a job exhausts CUDA-mapped host scratch after allocation retries, its rejection also includes the MIDI, SFZ, and requested bytes; remaining jobs continue. A batch containing only job-level failures returns exit status 2. Fatal setup or runtime errors return exit status 1.
+Successful jobs print `OK` and write PCM16 WAVs by default. Select `--output-format flac` to encode the same PCM16 samples directly on the CPU. Compression levels range from 0 to 8 and default to 5 (for example, `--flac-level 8`). Rejected jobs print `REJECT` with the input or output and reason. If a job exhausts CUDA-mapped host scratch after allocation retries, its rejection also includes the MIDI, SFZ, and requested bytes; remaining jobs continue. A batch containing only job-level failures returns exit status 2. Fatal setup or runtime errors return exit status 1.
 
-During rendering, the CPU prepares upcoming jobs and writes completed WAVs while the GPU works. Stateful synthesis can admit jobs from the next ready CPU planning window at segment boundaries, without another ClayEngine request. A sample-bank reset drains active jobs before switching banks. In `natural` mode, the GPU sends the finished mono PCM16 samples and output metadata to the host for WAV writing.
+During rendering, the CPU prepares upcoming jobs and writes completed audio files while the GPU works. Stateful synthesis can admit jobs from the next ready CPU planning window at segment boundaries, without another ClayEngine request. A sample-bank reset drains active jobs before switching banks. In `natural` mode, the GPU sends the finished mono PCM16 samples and output metadata to the host for output.
 
 The renderer bounds active jobs and reusable synthesis scratch by available VRAM. Each resident job keeps its own playback and filter state. Completed jobs free their synthesis storage for queued jobs; volume-group members retain accepted PCM until matching. Segment sizing preserves parallel work across notes and shortens intervals when scratch requires it. Starting windows without recurrence work retain the batched fast path. Allocation recovery retries smaller workloads and can back a single job's scratch with CUDA-mapped host memory.
 
@@ -46,9 +46,9 @@ To check whether a preset loads and its sample headers resolve, run `claysampler
 
 ## Tail policies
 
-- `--tail-policy natural` is the default and produces mono WAVs using ClayEngine's `sfizz_native_mono_v7` finishing rules. It releases held pedals at the end of the performance, detects silence in the floating-point mix, and shortens an extended quiet tail with a gentle fade. `--max-audio-seconds` optionally bounds the entire render. A job that hits the limit before becoming quiet is rejected.
-- `--tail-policy orig` produces stereo WAVs with the previous ClaySampler release and file-length behavior.
-- `--tail-policy custom --tail-max-seconds 2 --tail-fade-ms 100` produces stereo WAVs with up to two seconds after the last MIDI performance or controller event. `--tail-max-seconds` is required and accepts fractional seconds from 0 to 3600. Zero ends the output at the last event. `--tail-fade-ms` accepts whole milliseconds from 0 to 3600000, defaults to 100, and can be set to zero to disable the fade. The fade applies only when the limit shortens the tail and stays within the tail.
+- `--tail-policy natural` is the default and produces mono audio using ClayEngine's `sfizz_native_mono_v7` finishing rules. It releases held pedals at the end of the performance, detects silence in the floating-point mix, and shortens an extended quiet tail with a gentle fade. `--max-audio-seconds` optionally bounds the entire render. A job that hits the limit before becoming quiet is rejected.
+- `--tail-policy orig` produces stereo audio with the previous ClaySampler release and file-length behavior.
+- `--tail-policy custom --tail-max-seconds 2 --tail-fade-ms 100` produces stereo audio with up to two seconds after the last MIDI performance or controller event. `--tail-max-seconds` is required and accepts fractional seconds from 0 to 3600. Zero ends the output at the last event. `--tail-fade-ms` accepts whole milliseconds from 0 to 3600000, defaults to 100, and can be set to zero to disable the fade. The fade applies only when the limit shortens the tail and stays within the tail.
 
 [Tail policy details and checks](docs/validation.md#tail-policies)
 
@@ -61,7 +61,7 @@ claysampler --sfz instrument.sfz --output renders --quality-gate clayengine take
 claysampler --jobs tasks.tsv --group-volume mean --quality-gate clayengine
 ```
 
-The UTF-8 job manifest has no header. Put the group ID, SFZ path, MIDI path and output WAV path on each row, separated by tabs. Relative paths are resolved against the manifest directory. Use `-` for an independent render. The caller assigns group IDs, and members can appear anywhere in the manifest.
+The UTF-8 job manifest has no header. Put the group ID, SFZ path, MIDI path and output path (ending in `.wav` or `.flac` to match the selected format) on each row, separated by tabs. Relative paths are resolved against the manifest directory. Use `-` for an independent render. The caller assigns group IDs, and members can appear anywhere in the manifest.
 
 ```tsv
 take-01	piano.sfz	take1.mid	renders/take1-piano.wav

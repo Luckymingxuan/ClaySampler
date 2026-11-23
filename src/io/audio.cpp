@@ -121,6 +121,35 @@ void AudioBank::releaseDecoded()
         sample.offset = UINT64_MAX;
 }
 
+void AudioBank::writeFlac(const std::filesystem::path& path, const int16_t* pcm, int dataFrames, int frames,
+                          int rate, int channels, int level) const
+{
+    constexpr int flacPcm16 = 0x170000 | 0x0002;
+    constexpr int writeMode = 0x20, setCompressionLevel = 0x1301;
+    auto write = decoder_->library.get<int64_t(*)(void*, const int16_t*, int64_t)>("sf_writef_short");
+    SoundInfo info{};
+    info.rate = rate;
+    info.channels = channels;
+    info.format = flacPcm16;
+    std::unique_ptr<void, int(*)(void*)> file(decoder_->open(path.c_str(), writeMode, &info), decoder_->close);
+    if (!file)
+        throw std::runtime_error("cannot create FLAC " + path.u8string());
+    double compression = level / 8.0;
+    if (!decoder_->command(file.get(), setCompressionLevel, &compression, sizeof compression))
+        throw std::runtime_error("cannot set FLAC compression level");
+    if (write(file.get(), pcm, dataFrames) != dataFrames)
+        throw std::runtime_error("cannot write FLAC " + path.u8string());
+    static constexpr int16_t silence[8192]{};
+    for (int remaining = frames - dataFrames; remaining > 0;) {
+        const int count = std::min(remaining, 8192 / channels);
+        if (write(file.get(), silence, count) != count)
+            throw std::runtime_error("cannot write FLAC " + path.u8string());
+        remaining -= count;
+    }
+    if (decoder_->close(file.release()))
+        throw std::runtime_error("cannot finish FLAC " + path.u8string());
+}
+
 void writeWave(const std::filesystem::path& path, const int16_t* pcm, int dataFrames, int frames,
                int rate, int channels)
 {
