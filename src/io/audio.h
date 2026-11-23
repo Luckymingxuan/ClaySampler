@@ -24,6 +24,7 @@ public:
     int describe(const std::filesystem::path& path);
     const Sample& decode(int id);
     void releaseDecoded();
+    bool completeOutput(const std::filesystem::path& path, bool flac, int rate, int channels) const;
     void writeFlac(const std::filesystem::path& path, const int16_t* pcm, int dataFrames, int frames,
                    int rate, int channels, int level) const;
 
@@ -33,6 +34,18 @@ public:
 private:
     struct Decoder;
     Decoder* decoder_;
+};
+
+class PendingOutput {
+public:
+    explicit PendingOutput(const std::filesystem::path& destination);
+    ~PendingOutput();
+    PendingOutput(const PendingOutput&) = delete;
+    PendingOutput& operator=(const PendingOutput&) = delete;
+    const std::filesystem::path& path() const { return temporary_; }
+    void publish();
+private:
+    std::filesystem::path destination_, temporary_;
 };
 
 void writeWave(const std::filesystem::path& path, const int16_t* pcm, int dataFrames, int frames,

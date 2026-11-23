@@ -29,6 +29,18 @@ Successful jobs print `OK` and write PCM16 WAVs by default. Select `--output-for
 
 During rendering, the CPU prepares upcoming jobs and writes completed audio files while the GPU works. Stateful synthesis can admit jobs from the next ready CPU planning window at segment boundaries, without another ClayEngine request. A sample-bank reset drains active jobs before switching banks. In `natural` mode, the GPU sends the finished mono PCM16 samples and output metadata to the host for output.
 
+With FLAC output, up to three CPU writers can encode different files from the same GPU batch. The default GPU batch size stays at 64. Each WAV or FLAC is encoded into a unique sibling `.part` file, closed, flushed to disk, and then renamed to its final name. An interrupted replacement preserves the previous final file until the new one is published.
+
+To continue an interrupted standalone render, repeat the original command with `--resume`:
+
+```sh
+claysampler --jobs tasks.tsv --output-format flac --resume
+```
+
+Use the same inputs, rendering settings and output directory. Resume checks audio completeness, sample rate and channel count. It compares a WAV's header to its actual byte length, and decodes a FLAC through its declared frame count. A complete file is reported as `SKIP`; missing or truncated files are rendered again. If any member of a volume-matched group needs rendering, the entire group is rendered together. Skipped jobs emit no new quality or volume measurements. Resume does not detect changes to a MIDI or preset, or same-length sample damage in a WAV. For changed inputs or settings, rerun without `--resume`.
+
+A killed process may leave `.part` files. They are ignored by resume and can be removed once all renders targeting the directory have stopped. ClayEngine manages its own dataset checkpoints; the flag above is for ClaySampler invocations.
+
 The renderer bounds active jobs and reusable synthesis scratch by available VRAM. Each resident job keeps its own playback and filter state. Completed jobs free their synthesis storage for queued jobs; volume-group members retain accepted PCM until matching. Segment sizing preserves parallel work across notes and shortens intervals when scratch requires it. Starting windows without recurrence work retain the batched fast path. Allocation recovery retries smaller workloads and can back a single job's scratch with CUDA-mapped host memory.
 
 The caller chooses how many jobs to submit per invocation. Within an invocation, callers can set the two job-count limits independently. Both accept positive integers and default to 64.

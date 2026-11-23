@@ -2,11 +2,18 @@
 #include "library.h"
 
 #include <algorithm>
+#include <atomic>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
+#ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace clay {
 namespace {
@@ -28,6 +35,28 @@ constexpr int readMode = 0x10;
 constexpr int getInstrument = 0x10d0;
 constexpr int forwardLoop = 801;
 
+std::array<unsigned char, 44> waveHeader(uint32_t bytes, int rate, int channels)
+{
+    std::array<unsigned char, 44> header{};
+    const auto put = [&](size_t offset, uint32_t value, int width) {
+        for (int i = 0; i < width; ++i)
+            header[offset + i] = static_cast<unsigned char>(value >> (8 * i));
+    };
+    std::memcpy(header.data(), "RIFF", 4);
+    put(4, bytes + 36, 4);
+    std::memcpy(header.data() + 8, "WAVEfmt ", 8);
+    put(16, 16, 4);
+    put(20, 1, 2);
+    put(22, channels, 2);
+    put(24, rate, 4);
+    put(28, rate * channels * 2, 4);
+    put(32, channels * 2, 2);
+    put(34, 16, 2);
+    std::memcpy(header.data() + 36, "data", 4);
+    put(40, bytes, 4);
+    return header;
+}
+
 } // namespace
 
 struct AudioBank::Decoder {
@@ -47,6 +76,9 @@ struct AudioBank::Decoder {
     int (*close)(void*) = library.get<int(*)(void*)>("sf_close");
     int64_t (*read)(void*, float*, int64_t) = library.get<int64_t(*)(void*, float*, int64_t)>("sf_readf_float");
     int (*command)(void*, int, void*, int) = library.get<int(*)(void*, int, void*, int)>("sf_command");
+    int64_t (*write)(void*, const int16_t*, int64_t) =
+        library.get<decltype(write)>("sf_writef_short");
+    int (*error)(void*) = library.get<decltype(error)>("sf_error");
     std::map<std::filesystem::path, int> loaded;
     std::vector<std::filesystem::path> paths;
 };
@@ -121,12 +153,91 @@ void AudioBank::releaseDecoded()
         sample.offset = UINT64_MAX;
 }
 
+bool AudioBank::completeOutput(const std::filesystem::path& path, bool flac, int rate, int channels) const
+{
+    if (!flac) {
+        std::ifstream input(path, std::ios::binary | std::ios::ate);
+        const std::streamoff size = input.tellg();
+        if (size <= 44 || size - 44 > UINT32_MAX - 36 || (size - 44) % (channels * 2)) return false;
+        std::array<unsigned char, 44> header;
+        input.seekg(0);
+        return input.read(reinterpret_cast<char*>(header.data()), header.size()) &&
+            header == waveHeader(static_cast<uint32_t>(size - 44), rate, channels);
+    }
+    SoundInfo info;
+    std::unique_ptr<void, int(*)(void*)> file(decoder_->open(path.c_str(), readMode, &info), decoder_->close);
+    if (!file || info.format != (0x170000 | 0x0002) || info.frames <= 0 ||
+        info.frames > std::numeric_limits<int>::max() || info.rate != rate || info.channels != channels)
+        return false;
+    std::array<float, 8192> buffer;
+    int64_t total = 0;
+    while (total < info.frames) {
+        const auto count = std::min<int64_t>(buffer.size() / channels, info.frames - total);
+        if (decoder_->read(file.get(), buffer.data(), count) != count) return false;
+        total += count;
+    }
+    return decoder_->error(file.get()) == 0;
+}
+
+PendingOutput::PendingOutput(const std::filesystem::path& destination) : destination_(destination)
+{
+    static std::atomic<uint64_t> serial{0};
+#ifdef _WIN32
+    const auto pid = GetCurrentProcessId();
+#else
+    const auto pid = getpid();
+#endif
+    for (;;) {
+        temporary_ = destination_.parent_path() /
+            ("claysampler." + std::to_string(pid) + "." + std::to_string(serial.fetch_add(1)) + ".part");
+#ifdef _WIN32
+        auto h = CreateFileW(temporary_.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); break; }
+        if (GetLastError() == ERROR_FILE_EXISTS) continue;
+#else
+        int fd = ::open(temporary_.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+        if (fd >= 0) { ::close(fd); break; }
+        if (errno == EEXIST) continue;
+#endif
+        throw std::runtime_error("cannot create temporary output for " + destination_.u8string());
+    }
+}
+
+PendingOutput::~PendingOutput()
+{
+    std::error_code ec;
+    if (!temporary_.empty()) std::filesystem::remove(temporary_, ec);
+}
+
+void PendingOutput::publish()
+{
+#ifdef _WIN32
+    auto h = CreateFileW(temporary_.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open completed output for flush");
+    const bool synced = FlushFileBuffers(h) != 0;
+    CloseHandle(h);
+    if (!synced || !MoveFileExW(temporary_.c_str(), destination_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        throw std::runtime_error("cannot publish " + destination_.u8string());
+#else
+    auto sync = [](const std::filesystem::path& path, int flags) {
+        const int fd = ::open(path.c_str(), flags);
+        if (fd < 0) throw std::runtime_error("cannot open for sync " + path.u8string());
+        const int status = ::fsync(fd);
+        const int closed = ::close(fd);
+        if (status || closed) throw std::runtime_error("cannot sync " + path.u8string());
+    };
+    sync(temporary_, O_WRONLY);
+    std::filesystem::rename(temporary_, destination_);
+    sync(destination_.has_parent_path() ? destination_.parent_path() : ".", O_RDONLY | O_DIRECTORY);
+#endif
+    temporary_.clear();
+}
+
 void AudioBank::writeFlac(const std::filesystem::path& path, const int16_t* pcm, int dataFrames, int frames,
                           int rate, int channels, int level) const
 {
     constexpr int flacPcm16 = 0x170000 | 0x0002;
     constexpr int writeMode = 0x20, setCompressionLevel = 0x1301;
-    auto write = decoder_->library.get<int64_t(*)(void*, const int16_t*, int64_t)>("sf_writef_short");
     SoundInfo info{};
     info.rate = rate;
     info.channels = channels;
@@ -137,12 +248,12 @@ void AudioBank::writeFlac(const std::filesystem::path& path, const int16_t* pcm,
     double compression = level / 8.0;
     if (!decoder_->command(file.get(), setCompressionLevel, &compression, sizeof compression))
         throw std::runtime_error("cannot set FLAC compression level");
-    if (write(file.get(), pcm, dataFrames) != dataFrames)
+    if (decoder_->write(file.get(), pcm, dataFrames) != dataFrames)
         throw std::runtime_error("cannot write FLAC " + path.u8string());
     static constexpr int16_t silence[8192]{};
     for (int remaining = frames - dataFrames; remaining > 0;) {
         const int count = std::min(remaining, 8192 / channels);
-        if (write(file.get(), silence, count) != count)
+        if (decoder_->write(file.get(), silence, count) != count)
             throw std::runtime_error("cannot write FLAC " + path.u8string());
         remaining -= count;
     }
@@ -157,23 +268,9 @@ void writeWave(const std::filesystem::path& path, const int16_t* pcm, int dataFr
     if (frames <= 0 || dataFrames < 0 || dataFrames > frames || static_cast<uint64_t>(frames) * stride + 36 > UINT32_MAX)
         throw std::runtime_error("output exceeds PCM16 WAV limits");
     std::ofstream file(path, std::ios::binary);
-    auto integer = [&](uint32_t value, int bytes) {
-        for (int i = 0; i < bytes; ++i)
-            file.put(static_cast<char>(value >> (8 * i)));
-    };
     const auto dataSize = static_cast<uint32_t>(frames) * stride;
-    file.write("RIFF", 4);
-    integer(dataSize + 36, 4);
-    file.write("WAVEfmt ", 8);
-    integer(16, 4);
-    integer(1, 2);
-    integer(channels, 2);
-    integer(rate, 4);
-    integer(rate * stride, 4);
-    integer(stride, 2);
-    integer(16, 2);
-    file.write("data", 4);
-    integer(dataSize, 4);
+    const auto header = waveHeader(dataSize, rate, channels);
+    file.write(reinterpret_cast<const char*>(header.data()), header.size());
     if (dataFrames)
         file.write(reinterpret_cast<const char*>(pcm), size_t(dataFrames) * stride);
     static constexpr char silence[16384]{};

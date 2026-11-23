@@ -36,10 +36,10 @@ def check(options, root):
         if value is not None:
             executable += [f"--{key}", value.resolve()]
 
-    def render(directory, rows, *flags, expected=0):
+    def render(directory, rows, *flags, expected=0, extension="wav"):
         manifest = root / f"{directory}.tsv"
         manifest.write_text(
-            "".join(f"{group}\t{preset}.sfz\t{source}.mid\t{directory}/{output}.wav\n"
+            "".join(f"{group}\t{preset}.sfz\t{source}.mid\t{directory}/{output}.{extension}\n"
                     for group, preset, source, output in rows),
             encoding="utf-8",
         )
@@ -54,6 +54,19 @@ def check(options, root):
         ("pair", "loud", "melody", "loud"),
     ]
     render("off", rows)
+    for extension in ("wav", "flac"):
+        directory = f"resume-{extension}"
+        accepted = [row for row in rows if row[1] != "quiet"]
+        flags = ("--group-volume", "mean", "--output-format", extension)
+        render(directory, accepted, *flags, extension=extension)
+        member = root / directory / f"soft.{extension}"
+        reference = member.read_bytes()
+        member.write_bytes(reference[:len(reference) // 2])
+        resumed = render(directory, accepted, *flags, "--resume", extension=extension)
+        assert resumed.stdout.count("SKIP\t") == 1 and resumed.stdout.count("OK\t") == 2
+        assert member.read_bytes() == reference
+        complete = render(directory, accepted, *flags, "--resume", extension=extension)
+        assert complete.stdout.count("SKIP\t") == 3 and "DEVICE\t" not in complete.stdout
     grouped = render("on", rows, "--group-volume", "mean", "--quality-gate", "clayengine", expected=2)
     assert "quiet_performance" in grouped.stderr and not (root / "on/quiet.wav").exists()
     assert (root / "off/independent.wav").read_bytes() == (root / "on/independent.wav").read_bytes()
